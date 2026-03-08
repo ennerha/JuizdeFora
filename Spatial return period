@@ -1,0 +1,483 @@
+# ============================================================
+# JUIZ DE FORA — ADVANCED PANELS (SEPARATE CODE, FIXED) ✅
+# AJUSTADO PARA OS ARQUIVOS JÁ GERADOS EM:
+# /content/drive/MyDrive/GEE_exports_JDF_MUNICIPAL
+#
+# Gera:
+# 1) mapa de tempo de retorno espacial
+# 2) painel top-20 eventos históricos
+# 3) painel de heterogeneidade espacial
+# 4) painel de comparação CHIRPS vs IMERG
+# ============================================================
+
+# -----------------------
+# 0) Instalar dependências
+# -----------------------
+!pip -q install geopandas rasterio scipy matplotlib scikit-learn pyproj shapely fiona
+
+import os
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+from scipy import stats
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+import rasterio
+from rasterio.mask import mask
+from rasterio.plot import plotting_extent
+
+warnings.filterwarnings("ignore")
+
+# -----------------------
+# 1) Montar Drive
+# -----------------------
+from google.colab import drive
+drive.mount("/content/drive", force_remount=False)
+
+# -----------------------
+# 2) CONFIG
+# -----------------------
+DRIVE_MP = "/content/drive"
+MYDRIVE = f"{DRIVE_MP}/MyDrive"
+
+OUT_DIR = f"{MYDRIVE}/GEE_exports_JDF_MUNICIPAL"
+CACHE_TAG = "v7_municipality_monthly_boxplot"
+
+EVENT_START = "2026-02-22"
+EVENT_END   = "2026-02-24"
+
+# shapefile do município
+ROI_SHP = f"{MYDRIVE}/JuizdeFora/Juiz_de_Fora_WGS_UTM_23_S.shp"
+
+# arquivos já existentes do pipeline principal
+CSV_CHIRPS = f"{OUT_DIR}/JDF_MUNIC_CHIRPS_daily_mean_{CACHE_TAG}.csv"
+CSV_IMERG  = f"{OUT_DIR}/JDF_MUNIC_IMERG_daily_mean_{CACHE_TAG}.csv"
+CSV_HYBRID = f"{OUT_DIR}/JDF_MUNIC_daily_1981_present_hybrid_{CACHE_TAG}.csv"
+CSV_RANKS  = f"{OUT_DIR}/JDF_MUNIC_event_historical_ranking_{CACHE_TAG}.csv"
+
+RASTER_EVENT_TIF      = f"{OUT_DIR}/JDF_MUNIC_event_accumulation_{CACHE_TAG}.tif"
+RASTER_CLIM_MEAN_TIF  = f"{OUT_DIR}/JDF_MUNIC_clim_mean_eventwindow_{CACHE_TAG}.tif"
+RASTER_ANOM_TIF       = f"{OUT_DIR}/JDF_MUNIC_event_anomaly_{CACHE_TAG}.tif"
+RASTER_ZSCORE_TIF     = f"{OUT_DIR}/JDF_MUNIC_event_zscore_{CACHE_TAG}.tif"
+RASTER_PERCENTILE_TIF = f"{OUT_DIR}/JDF_MUNIC_event_percentile_{CACHE_TAG}.tif"
+
+# novos outputs
+FIG_RETURN_PERIOD_TIF = f"{OUT_DIR}/FIG_JDF_MUNIC_return_period_panel_500dpi_{CACHE_TAG}.tif"
+FIG_TOP20_TIF         = f"{OUT_DIR}/FIG_JDF_MUNIC_top20_events_panel_500dpi_{CACHE_TAG}.tif"
+FIG_HETEROGENEITY_TIF = f"{OUT_DIR}/FIG_JDF_MUNIC_spatial_heterogeneity_panel_500dpi_{CACHE_TAG}.tif"
+FIG_CHIRPS_IMERG_TIF  = f"{OUT_DIR}/FIG_JDF_MUNIC_CHIRPS_IMERG_comparison_500dpi_{CACHE_TAG}.tif"
+
+CSV_TOP20_EVENTS       = f"{OUT_DIR}/JDF_MUNIC_top20_historical_events_{CACHE_TAG}.csv"
+CSV_HETEROGENEITY      = f"{OUT_DIR}/JDF_MUNIC_spatial_heterogeneity_{CACHE_TAG}.csv"
+CSV_CHIRPS_IMERG_STATS = f"{OUT_DIR}/JDF_MUNIC_CHIRPS_IMERG_stats_{CACHE_TAG}.csv"
+RASTER_RETURN_PERIOD   = f"{OUT_DIR}/JDF_MUNIC_return_period_{CACHE_TAG}.tif"
+
+DPI = 500
+
+plt.rcParams.update({
+    "savefig.dpi": DPI,
+    "figure.dpi": 150,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 8,
+    "axes.labelsize": 9,
+    "axes.titlesize": 10,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 7,
+    "figure.titlesize": 12,
+})
+
+# -----------------------
+# 3) CHECAGEM
+# -----------------------
+required = [
+    ROI_SHP,
+    CSV_CHIRPS, CSV_IMERG, CSV_HYBRID, CSV_RANKS,
+    RASTER_EVENT_TIF, RASTER_CLIM_MEAN_TIF, RASTER_ANOM_TIF,
+    RASTER_ZSCORE_TIF, RASTER_PERCENTILE_TIF
+]
+
+# validar shapefile completo
+roi_base = os.path.splitext(ROI_SHP)[0]
+for ext in [".shp", ".shx", ".dbf", ".prj"]:
+    p = roi_base + ext
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Arquivo do shapefile não encontrado:\n{p}")
+
+for p in required[1:]:
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Arquivo não encontrado:\n{p}")
+
+print("✅ Todos os arquivos necessários foram encontrados.")
+
+# -----------------------
+# 4) HELPERS
+# -----------------------
+def load_precip_csv(path):
+    df = pd.read_csv(path)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+    df = df.dropna(subset=["date", "precip_mm"]).sort_values("date").drop_duplicates("date")
+    return df[["date", "precip_mm"]]
+
+def read_clip_raster(path, clip_gdf):
+    with rasterio.open(path) as src:
+        out_image, out_transform = mask(src, clip_gdf.geometry, crop=True, nodata=np.nan)
+        arr = out_image[0].astype(float)
+        arr[arr <= -9999] = np.nan
+        extent = plotting_extent(out_image[0], out_transform)
+        meta = src.meta.copy()
+        meta.update({
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform,
+            "count": 1,
+            "dtype": "float32",
+            "nodata": np.nan
+        })
+    return arr, extent, meta
+
+def write_singleband_geotiff(path, arr, meta):
+    meta2 = meta.copy()
+    meta2["dtype"] = "float32"
+    with rasterio.open(path, "w", **meta2) as dst:
+        dst.write(arr.astype("float32"), 1)
+
+def finite_vals(arr):
+    x = np.asarray(arr, dtype=float)
+    return x[np.isfinite(x)]
+
+def coefficient_of_variation(arr):
+    x = finite_vals(arr)
+    if x.size == 0:
+        return np.nan
+    mu = np.mean(x)
+    sd = np.std(x)
+    return np.nan if mu == 0 else float(sd / mu * 100.0)
+
+def gini_coefficient(arr):
+    x = finite_vals(arr)
+    if x.size == 0:
+        return np.nan
+    x = np.sort(x)
+    if np.allclose(x.sum(), 0):
+        return np.nan
+    n = len(x)
+    idx = np.arange(1, n + 1)
+    return float(np.sum((2 * idx - n - 1) * x) / (n * np.sum(x)))
+
+def spatial_autocorr_proxy(arr):
+    a = np.array(arr, dtype=float)
+    maskv = np.isfinite(a)
+    vals = []
+
+    for di, dj in [(1, 0), (0, 1)]:
+        a1 = a[:-di or None, :-dj or None]
+        a2 = a[di:, dj:]
+        m1 = maskv[:-di or None, :-dj or None]
+        m2 = maskv[di:, dj:]
+        m = m1 & m2
+        if m.sum() > 5:
+            v1 = a1[m]
+            v2 = a2[m]
+            if np.std(v1) > 0 and np.std(v2) > 0:
+                vals.append(np.corrcoef(v1, v2)[0, 1])
+
+    return float(np.nanmean(vals)) if vals else np.nan
+
+def rolling_top_events(series, windows=(1,2,3,5,7), topn=20):
+    out = {}
+    for w in windows:
+        roll = series.rolling(w).sum().dropna()
+        top = roll.sort_values(ascending=False).head(topn).reset_index()
+        top.columns = ["date_end", "accum_mm"]
+        top["window_days"] = w
+        top["rank"] = np.arange(1, len(top) + 1)
+        out[w] = top[["rank", "date_end", "window_days", "accum_mm"]]
+    return out
+
+# -----------------------
+# 5) LOAD DATA
+# -----------------------
+gdf_roi = gpd.read_file(ROI_SHP).to_crs("EPSG:4326")
+
+df_ch = load_precip_csv(CSV_CHIRPS)
+df_im = load_precip_csv(CSV_IMERG)
+df_h  = load_precip_csv(CSV_HYBRID)
+ranks = pd.read_csv(CSV_RANKS)
+
+p = df_h.set_index("date")["precip_mm"].astype(float).sort_index()
+
+# -----------------------
+# 6) RETURN PERIOD RASTER
+# -----------------------
+arr_pct, ext_pct, meta_pct = read_clip_raster(RASTER_PERCENTILE_TIF, gdf_roi)
+
+pfrac = arr_pct / 100.0
+rp = np.full_like(arr_pct, np.nan, dtype=float)
+valid = np.isfinite(pfrac) & (pfrac < 1.0)
+rp[valid] = 1.0 / np.maximum(1.0 - pfrac[valid], 1e-6)
+
+rp_plot = rp.copy()
+rp_plot[np.isfinite(rp_plot) & (rp_plot > 500)] = 500
+
+write_singleband_geotiff(RASTER_RETURN_PERIOD, rp_plot, meta_pct)
+
+# -----------------------
+# 7) TOP-20 HISTORICAL EVENTS
+# -----------------------
+top_events = rolling_top_events(p, windows=(1,2,3,5,7), topn=20)
+
+top_concat = []
+for w, dfw in top_events.items():
+    top_concat.append(dfw.copy())
+top_concat = pd.concat(top_concat, ignore_index=True)
+top_concat.to_csv(CSV_TOP20_EVENTS, index=False)
+
+# -----------------------
+# 8) HETEROGENEIDADE ESPACIAL
+# -----------------------
+arr_event, ext_event, _ = read_clip_raster(RASTER_EVENT_TIF, gdf_roi)
+arr_clim, ext_clim, _   = read_clip_raster(RASTER_CLIM_MEAN_TIF, gdf_roi)
+arr_anom, ext_anom, _   = read_clip_raster(RASTER_ANOM_TIF, gdf_roi)
+arr_z, ext_z, _         = read_clip_raster(RASTER_ZSCORE_TIF, gdf_roi)
+
+hetero_rows = []
+
+for name, arr in [
+    ("event_accumulation", arr_event),
+    ("climatology", arr_clim),
+    ("anomaly", arr_anom),
+    ("zscore", arr_z),
+]:
+    vals = finite_vals(arr)
+    hetero_rows.append({
+        "field": name,
+        "mean": float(np.nanmean(vals)) if vals.size else np.nan,
+        "std": float(np.nanstd(vals)) if vals.size else np.nan,
+        "cv_pct": coefficient_of_variation(arr),
+        "gini": gini_coefficient(arr),
+        "spatial_continuity_proxy": spatial_autocorr_proxy(arr),
+        "min": float(np.nanmin(vals)) if vals.size else np.nan,
+        "max": float(np.nanmax(vals)) if vals.size else np.nan,
+        "p90": float(np.nanpercentile(vals, 90)) if vals.size else np.nan,
+        "p95": float(np.nanpercentile(vals, 95)) if vals.size else np.nan,
+    })
+
+df_hetero = pd.DataFrame(hetero_rows)
+df_hetero.to_csv(CSV_HETEROGENEITY, index=False)
+
+# -----------------------
+# 9) CHIRPS vs IMERG
+# -----------------------
+df_cmp = pd.merge(df_ch, df_im, on="date", how="inner", suffixes=("_chirps", "_imerg"))
+df_cmp = df_cmp.dropna().copy()
+
+if len(df_cmp) == 0:
+    raise ValueError("Não há sobreposição entre CHIRPS e IMERG para comparação.")
+
+x = df_cmp["precip_mm_chirps"].values
+y = df_cmp["precip_mm_imerg"].values
+
+mae  = mean_absolute_error(x, y)
+# FIX: Calcular RMSE manualmente (compatível com todas as versões do sklearn)
+mse  = mean_squared_error(x, y)
+rmse = np.sqrt(mse)
+bias = float(np.mean(y - x))
+r2   = r2_score(x, y) if len(np.unique(x)) > 1 else np.nan
+rho  = stats.spearmanr(x, y).statistic if len(x) > 2 else np.nan
+pear = np.corrcoef(x, y)[0, 1] if len(x) > 2 else np.nan
+
+df_stats_cmp = pd.DataFrame([{
+    "n_overlap_days": len(df_cmp),
+    "MAE_mm": mae,
+    "RMSE_mm": rmse,
+    "BIAS_IMERG_minus_CHIRPS_mm": bias,
+    "R2": r2,
+    "Pearson_r": pear,
+    "Spearman_rho": rho,
+}])
+df_stats_cmp.to_csv(CSV_CHIRPS_IMERG_STATS, index=False)
+
+# -----------------------
+# 10) FIGURE — RETURN PERIOD PANEL
+# -----------------------
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+im1 = axes[0].imshow(arr_pct, extent=ext_pct, origin="upper", cmap="viridis", vmin=0, vmax=100)
+gdf_roi.boundary.plot(ax=axes[0], color="black", linewidth=1.2)
+axes[0].set_title("A) Event percentile", fontweight="bold", loc="left")
+axes[0].set_xlabel("Longitude")
+axes[0].set_ylabel("Latitude")
+plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+im2 = axes[1].imshow(rp_plot, extent=ext_pct, origin="upper", cmap="magma", vmin=1, vmax=100)
+gdf_roi.boundary.plot(ax=axes[1], color="black", linewidth=1.2)
+axes[1].set_title("B) Return period (years)", fontweight="bold", loc="left")
+axes[1].set_xlabel("Longitude")
+axes[1].set_ylabel("Latitude")
+plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+plt.suptitle("Juiz de Fora Municipality — Percentile and Return Period Panel", fontsize=14, fontweight="bold", y=0.99)
+plt.tight_layout()
+plt.savefig(FIG_RETURN_PERIOD_TIF, dpi=DPI, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close()
+
+# -----------------------
+# 11) FIGURE — TOP-20 EVENTS PANEL
+# -----------------------
+fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+axes = axes.ravel()
+
+windows = [1, 2, 3, 5, 7]
+for i, w in enumerate(windows):
+    ax = axes[i]
+    dfw = top_events[w].copy()
+    vals = dfw["accum_mm"].values
+    # FIX: Converter para string de forma compatível
+    labs = pd.to_datetime(dfw["date_end"]).dt.strftime("%Y-%m-%d").tolist()
+
+    ax.barh(np.arange(len(vals)), vals, color="steelblue", alpha=0.8)
+    ax.set_yticks(np.arange(len(vals)))
+    ax.set_yticklabels([f"{r}. {lab}" for r, lab in zip(dfw["rank"], labs)], fontsize=7)
+    ax.invert_yaxis()
+    ax.set_title(f"{w}-day accumulations", fontweight="bold", loc="left")
+    ax.set_xlabel("Accumulated precipitation (mm)")
+    ax.grid(True, axis="x", alpha=0.3)
+
+    ev = ranks.loc[ranks["window"] == w, "event_value"].values
+    if len(ev):
+        evv = ev[0]
+        ax.axvline(evv, color="red", linestyle="--", linewidth=1.5, label=f"2026 event = {evv:.1f} mm")
+        ax.legend(loc="lower right")
+
+axes[5].axis("off")
+txt = (
+    "Top-20 historical events by rolling accumulation\n\n"
+    "Panels show the largest historical accumulations\n"
+    "for 1-, 2-, 3-, 5-, and 7-day windows.\n\n"
+    "The dashed red line marks the 2026 event value\n"
+    "for each corresponding duration."
+)
+axes[5].text(0.02, 0.98, txt, va="top", ha="left", fontsize=11)
+
+plt.suptitle("Juiz de Fora Municipality — Top Historical Events Panel", fontsize=14, fontweight="bold", y=0.99)
+plt.tight_layout()
+plt.savefig(FIG_TOP20_TIF, dpi=DPI, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close()
+
+# -----------------------
+# 12) FIGURE — SPATIAL HETEROGENEITY PANEL
+# -----------------------
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+axes = axes.ravel()
+
+axes[0].bar(df_hetero["field"], df_hetero["cv_pct"], color=["#1f77b4", "#17becf", "#d62728", "#9467bd"])
+axes[0].set_title("A) Coefficient of variation", fontweight="bold", loc="left")
+axes[0].set_ylabel("CV (%)")
+axes[0].tick_params(axis="x", rotation=25)
+axes[0].grid(True, axis="y", alpha=0.3)
+
+axes[1].bar(df_hetero["field"], df_hetero["gini"], color=["#1f77b4", "#17becf", "#d62728", "#9467bd"])
+axes[1].set_title("B) Gini coefficient", fontweight="bold", loc="left")
+axes[1].set_ylabel("Gini")
+axes[1].tick_params(axis="x", rotation=25)
+axes[1].grid(True, axis="y", alpha=0.3)
+
+axes[2].bar(df_hetero["field"], df_hetero["spatial_continuity_proxy"], color=["#1f77b4", "#17becf", "#d62728", "#9467bd"])
+axes[2].set_title("C) Spatial continuity proxy", fontweight="bold", loc="left")
+axes[2].set_ylabel("Correlation")
+axes[2].tick_params(axis="x", rotation=25)
+axes[2].grid(True, axis="y", alpha=0.3)
+
+axes[3].axis("off")
+summary_lines = []
+for _, r in df_hetero.iterrows():
+    summary_lines.append(
+        f"{r['field']}:\n"
+        f"  CV = {r['cv_pct']:.2f}%\n"
+        f"  Gini = {r['gini']:.3f}\n"
+        f"  continuity = {r['spatial_continuity_proxy']:.3f}\n"
+    )
+axes[3].text(0.02, 0.98, "\n".join(summary_lines), va="top", ha="left", fontsize=10)
+
+plt.suptitle("Juiz de Fora Municipality — Spatial Heterogeneity Panel", fontsize=14, fontweight="bold", y=0.99)
+plt.tight_layout()
+plt.savefig(FIG_HETEROGENEITY_TIF, dpi=DPI, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close()
+
+# -----------------------
+# 13) FIGURE — CHIRPS vs IMERG PANEL
+# -----------------------
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+axes = axes.ravel()
+
+axes[0].scatter(df_cmp["precip_mm_chirps"], df_cmp["precip_mm_imerg"], s=12, alpha=0.45)
+xymax = max(df_cmp["precip_mm_chirps"].max(), df_cmp["precip_mm_imerg"].max())
+axes[0].plot([0, xymax], [0, xymax], "r--", linewidth=1.2)
+axes[0].set_title("A) Daily CHIRPS vs IMERG", fontweight="bold", loc="left")
+axes[0].set_xlabel("CHIRPS (mm/day)")
+axes[0].set_ylabel("IMERG (mm/day)")
+axes[0].grid(True, alpha=0.3)
+
+sub = df_cmp.tail(365).copy() if len(df_cmp) > 365 else df_cmp.copy()
+axes[1].plot(sub["date"], sub["precip_mm_chirps"], label="CHIRPS", linewidth=1)
+axes[1].plot(sub["date"], sub["precip_mm_imerg"], label="IMERG", linewidth=1)
+axes[1].set_title("B) Overlap time series", fontweight="bold", loc="left")
+axes[1].set_ylabel("mm/day")
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+axes[1].tick_params(axis="x", rotation=30)
+
+resid = df_cmp["precip_mm_imerg"] - df_cmp["precip_mm_chirps"]
+axes[2].hist(resid, bins=40, color="gray", alpha=0.8, edgecolor="black")
+axes[2].axvline(np.mean(resid), color="red", linestyle="--", linewidth=1.2, label=f"Mean bias = {np.mean(resid):.2f}")
+axes[2].set_title("C) Residuals (IMERG - CHIRPS)", fontweight="bold", loc="left")
+axes[2].set_xlabel("Residual (mm/day)")
+axes[2].set_ylabel("Frequency")
+axes[2].legend()
+axes[2].grid(True, alpha=0.3)
+
+axes[3].axis("off")
+txt = (
+    f"Overlap days = {len(df_cmp)}\n\n"
+    f"MAE = {mae:.3f} mm\n"
+    f"RMSE = {rmse:.3f} mm\n"
+    f"Bias (IMERG - CHIRPS) = {bias:.3f} mm\n"
+    f"R² = {r2:.3f}\n"
+    f"Pearson r = {pear:.3f}\n"
+    f"Spearman ρ = {rho:.3f}"
+)
+axes[3].text(0.02, 0.98, txt, va="top", ha="left", fontsize=11)
+
+plt.suptitle("Juiz de Fora Municipality — CHIRPS vs IMERG Comparison Panel", fontsize=14, fontweight="bold", y=0.99)
+plt.tight_layout()
+plt.savefig(FIG_CHIRPS_IMERG_TIF, dpi=DPI, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close()
+
+# -----------------------
+# 14) FINAL
+# -----------------------
+print("\n✅ ADVANCED PANELS GENERATED")
+print("\nCSVs:")
+print(" -", CSV_TOP20_EVENTS)
+print(" -", CSV_HETEROGENEITY)
+print(" -", CSV_CHIRPS_IMERG_STATS)
+
+print("\nRasters:")
+print(" -", RASTER_RETURN_PERIOD)
+
+print("\nFigures:")
+print(" -", FIG_RETURN_PERIOD_TIF)
+print(" -", FIG_TOP20_TIF)
+print(" -", FIG_HETEROGENEITY_TIF)
+print(" -", FIG_CHIRPS_IMERG_TIF)
