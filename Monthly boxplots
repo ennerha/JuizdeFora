@@ -1,0 +1,1298 @@
+# ============================================================
+# JUIZ DE FORA — FULL END-TO-END COLAB PIPELINE (MUNICIPAL LIMIT ONLY) ✅
+# UPDATED VERSION WITH:
+# - Monthly boxplots (Jan, Feb, Mar, ..., Dec)
+# - Clear highlighting of February 2026 event position in the monthly boxplot
+# - All analyses using ONLY the municipal boundary of Juiz de Fora
+#
+# INPUT SHAPEFILE:
+#   Drive --> JuizdeFora --> Juiz_de_Fora_WGS_UTM_23_S.shp
+#
+# OUTPUTS:
+# - CHIRPS + IMERG hybrid daily series for municipality only
+# - ETCCDI-like annual indices
+# - Event ranking / boxplots
+# - Monthly climatology boxplots with Feb/2026 event highlighted
+# - Spatial rainfall analysis over municipality only
+# - Main spatial indices panel
+# - Summary table
+# - All figures at 500 dpi
+#
+# QUEUE-FREE VERSION:
+# - CHIRPS via getInfo() year-by-year
+# - IMERG via getInfo() month-by-month
+# ============================================================
+
+# -----------------------
+# 0) Install deps
+# -----------------------
+!pip -q install geemap geopandas pyproj shapely fiona rasterio scipy matplotlib
+
+import os
+import glob
+import calendar
+import warnings
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import TwoSlopeNorm
+from scipy import stats
+
+import rasterio
+from rasterio.mask import mask
+from rasterio.plot import plotting_extent
+
+warnings.filterwarnings("ignore")
+
+# -----------------------
+# 1) Robust Drive mount
+# -----------------------
+from google.colab import drive
+
+def safe_drive_mount(preferred="/content/drive"):
+    def is_mounted(path):
+        if not os.path.exists(path):
+            return False
+        return os.path.isdir(os.path.join(path, "MyDrive"))
+
+    if is_mounted(preferred):
+        print(f"✅ '{preferred}' already mounted and valid.")
+        return preferred
+
+    if os.path.exists(preferred) and os.path.isfile(preferred):
+        os.remove(preferred)
+
+    os.makedirs(preferred, exist_ok=True)
+    drive.mount(preferred, force_remount=False)
+    return preferred
+
+DRIVE_MP = safe_drive_mount("/content/drive")
+print("✅ Drive mounted at:", DRIVE_MP)
+
+# -----------------------
+# 2) USER CONFIG
+# -----------------------
+EE_PROJECT = "ee-enneralcantara2"
+
+ROI_SHP = f"{DRIVE_MP}/MyDrive/JuizdeFora/Juiz_de_Fora_WGS_UTM_23_S.shp"
+
+OUT_DIR = f"{DRIVE_MP}/MyDrive/GEE_exports_JDF_MUNICIPAL"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+START_DATE = "1981-01-01"
+END_DATE   = datetime.utcnow().strftime("%Y-%m-%d")
+
+EVENT_START = "2026-02-22"
+EVENT_END   = "2026-02-24"
+
+BASELINE_START = "1981-01-01"
+BASELINE_END   = "2010-12-31"
+
+CHIRPS_ID = "UCSB-CHG/CHIRPS/DAILY"
+IMERG_ID  = "NASA/GPM_L3/IMERG_V07"
+
+CACHE_TAG = "v7_municipality_monthly_boxplot"
+
+# For speed. Expand if needed.
+IMERG_START_YEAR = 2026
+IMERG_END_YEAR   = 2026
+
+# CSV outputs
+CSV_CHIRPS = os.path.join(OUT_DIR, f"JDF_MUNIC_CHIRPS_daily_mean_{CACHE_TAG}.csv")
+CSV_IMERG  = os.path.join(OUT_DIR, f"JDF_MUNIC_IMERG_daily_mean_{CACHE_TAG}.csv")
+CSV_HYBRID = os.path.join(OUT_DIR, f"JDF_MUNIC_daily_1981_present_hybrid_{CACHE_TAG}.csv")
+
+CSV_INDICES = os.path.join(OUT_DIR, f"JDF_MUNIC_ETCCDI_like_annual_indices_{CACHE_TAG}.csv")
+CSV_RANKS   = os.path.join(OUT_DIR, f"JDF_MUNIC_event_historical_ranking_{CACHE_TAG}.csv")
+CSV_SPATIAL_STATS = os.path.join(OUT_DIR, f"JDF_MUNIC_spatial_indices_{CACHE_TAG}.csv")
+
+# Figure outputs
+FIG_COMPOSITE_TIF       = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_composite_500dpi_{CACHE_TAG}.tif")
+FIG_ETCCDI_TIF          = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_ETCCDI_panel_500dpi_{CACHE_TAG}.tif")
+FIG_BOXPLOTS_TIF        = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_boxplots_event_position_500dpi_{CACHE_TAG}.tif")
+FIG_MONTHLY_BOXPLOT_TIF = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_monthly_boxplots_event_position_500dpi_{CACHE_TAG}.tif")
+FIG_SPATIAL_TIF         = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_spatial_panel_500dpi_{CACHE_TAG}.tif")
+FIG_SPATIAL_INDICES_TIF = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_spatial_indices_panel_500dpi_{CACHE_TAG}.tif")
+FIG_TABLE_TIF           = os.path.join(OUT_DIR, f"FIG_JDF_MUNIC_summary_table_500dpi_{CACHE_TAG}.tif")
+
+# Spatial rasters
+RASTER_EVENT_TIF      = os.path.join(OUT_DIR, f"JDF_MUNIC_event_accumulation_{CACHE_TAG}.tif")
+RASTER_CLIM_MEAN_TIF  = os.path.join(OUT_DIR, f"JDF_MUNIC_clim_mean_eventwindow_{CACHE_TAG}.tif")
+RASTER_ANOM_TIF       = os.path.join(OUT_DIR, f"JDF_MUNIC_event_anomaly_{CACHE_TAG}.tif")
+RASTER_ZSCORE_TIF     = os.path.join(OUT_DIR, f"JDF_MUNIC_event_zscore_{CACHE_TAG}.tif")
+RASTER_PERCENTILE_TIF = os.path.join(OUT_DIR, f"JDF_MUNIC_event_percentile_{CACHE_TAG}.tif")
+
+# Figure settings
+DPI = 500
+plt.rcParams.update({
+    "savefig.dpi": DPI,
+    "figure.dpi": 150,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 8,
+    "axes.labelsize": 9,
+    "axes.titlesize": 10,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 7,
+    "figure.titlesize": 12,
+    "text.usetex": False,
+    "axes.linewidth": 0.8,
+    "grid.linewidth": 0.5,
+    "lines.linewidth": 1.0,
+})
+
+COLORS = {
+    "primary":   "#1f77b4",
+    "secondary": "#ff7f0e",
+    "danger":    "#d62728",
+    "info":      "#17becf",
+    "warning":   "#ff9896",
+    "green":     "#2ca02c",
+    "purple":    "#9467bd",
+}
+
+# -----------------------
+# 3) Check shapefile completeness
+# -----------------------
+base = os.path.splitext(ROI_SHP)[0]
+needed = [base + ext for ext in [".shp", ".shx", ".dbf", ".prj"]]
+missing = [p for p in needed if not os.path.exists(p)]
+if missing:
+    raise FileNotFoundError("Municipality shapefile incomplete. Missing:\n- " + "\n- ".join(missing))
+print("✅ Municipality shapefile OK:", ROI_SHP)
+
+# -----------------------
+# 4) Helpers
+# -----------------------
+def find_latest_matching(out_dir: str, prefix: str):
+    files = glob.glob(os.path.join(out_dir, f"{prefix}*.csv"))
+    if not files:
+        return None
+    files = sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+def load_precip_csv(path):
+    df = pd.read_csv(path)
+    if "date" not in df.columns or "precip_mm" not in df.columns:
+        raise ValueError(f"CSV inválido: {path} | colunas={df.columns.tolist()}")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
+    return df[["date", "precip_mm"]]
+
+def read_clip_raster(path, clip_gdf):
+    with rasterio.open(path) as src:
+        out_image, out_transform = mask(src, clip_gdf.geometry, crop=True, nodata=np.nan)
+        arr = out_image[0].astype(float)
+        arr[arr <= -9999] = np.nan
+        extent = plotting_extent(out_image[0], out_transform)
+    return arr, extent
+
+def finite_stats(arr):
+    x = np.asarray(arr, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return {
+            "mean": np.nan, "median": np.nan, "std": np.nan, "min": np.nan,
+            "max": np.nan, "p90": np.nan, "p95": np.nan, "p99": np.nan,
+            "cv_pct": np.nan
+        }
+    mean = float(np.nanmean(x))
+    std = float(np.nanstd(x))
+    return {
+        "mean": mean,
+        "median": float(np.nanmedian(x)),
+        "std": std,
+        "min": float(np.nanmin(x)),
+        "max": float(np.nanmax(x)),
+        "p90": float(np.nanpercentile(x, 90)),
+        "p95": float(np.nanpercentile(x, 95)),
+        "p99": float(np.nanpercentile(x, 99)),
+        "cv_pct": float((std / mean) * 100.0) if np.isfinite(mean) and mean != 0 else np.nan,
+    }
+
+def frac_ge(arr, thr):
+    x = np.asarray(arr, dtype=float)
+    valid = np.isfinite(x)
+    if valid.sum() == 0:
+        return np.nan
+    return float((x[valid] >= thr).sum() / valid.sum() * 100.0)
+
+def frac_gt(arr, thr):
+    x = np.asarray(arr, dtype=float)
+    valid = np.isfinite(x)
+    if valid.sum() == 0:
+        return np.nan
+    return float((x[valid] > thr).sum() / valid.sum() * 100.0)
+
+# -----------------------
+# 5) Earth Engine init
+# -----------------------
+import geemap
+import ee
+
+def ee_init_with_project(project):
+    try:
+        ee.Initialize(project=project)
+        return
+    except Exception as e:
+        print("⚠️ ee.Initialize failed (will authenticate). Reason:", str(e)[:180], "...")
+        ee.Authenticate()
+        ee.Initialize(project=project)
+
+ee_init_with_project(EE_PROJECT)
+print("✅ Earth Engine initialized with project:", EE_PROJECT)
+
+# -----------------------
+# 6) Load municipality geometry
+# -----------------------
+gdf_roi = gpd.read_file(ROI_SHP)
+if gdf_roi.empty:
+    raise ValueError("Municipality shapefile has no features.")
+
+gdf_roi = gdf_roi.to_crs("EPSG:4326")
+roi_union = gdf_roi.unary_union
+
+roi_fc = geemap.geopandas_to_ee(gpd.GeoDataFrame(geometry=[roi_union], crs="EPSG:4326"))
+roi_geom = roi_fc.geometry()
+
+print("✅ Municipality loaded and will be used as the ONLY analysis boundary.")
+print("Bounds:", roi_union.bounds)
+
+# -----------------------
+# 7) CHIRPS daily via getInfo() YEAR-BY-YEAR
+# -----------------------
+def chirps_daily_fc(start, end):
+    ic = ee.ImageCollection(CHIRPS_ID).filterDate(start, end).select(["precipitation"])
+    scale = 5500
+
+    def img_to_feat(img):
+        stat = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=roi_geom,
+            scale=scale,
+            bestEffort=True,
+            maxPixels=1e13
+        )
+        d = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
+        return ee.Feature(None, {"date": d, "precip_mm": stat.get("precipitation")})
+
+    return ee.FeatureCollection(ic.map(img_to_feat))
+
+def fetch_chirps_year_to_csv(year, chirps_last_date):
+    start = pd.Timestamp(year=year, month=1, day=1)
+    end = pd.Timestamp(year=year + 1, month=1, day=1)
+
+    chirps_last_date = pd.to_datetime(chirps_last_date)
+    if start > chirps_last_date:
+        return None
+
+    end = min(end, chirps_last_date + pd.Timedelta(days=1))
+
+    prefix = f"JDF_MUNIC_CHIRPS_daily_mean_{CACHE_TAG}_{year}"
+    expected = os.path.join(OUT_DIR, f"{prefix}.csv")
+
+    if os.path.exists(expected) and os.path.getsize(expected) > 0:
+        print(f"✅ CHIRPS {year} cache hit:", expected)
+        return expected
+
+    alt = find_latest_matching(OUT_DIR, prefix)
+    if alt and os.path.getsize(alt) > 0:
+        print(f"✅ CHIRPS {year} using existing file:", alt)
+        return alt
+
+    print(f"⏳ Fetching CHIRPS {year}: {start.date()} → {(end - pd.Timedelta(days=1)).date()}")
+    fc = chirps_daily_fc(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    info = fc.getInfo()
+    feats = info.get("features", [])
+
+    rows = []
+    for ft in feats:
+        props = ft.get("properties", {})
+        rows.append({
+            "date": props.get("date"),
+            "precip_mm": props.get("precip_mm")
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["date", "precip_mm"])
+
+    df.to_csv(expected, index=False)
+    print(f"✅ Saved CHIRPS year CSV: {expected} | n={len(df)}")
+    return expected
+
+def ensure_chirps_csv():
+    if os.path.exists(CSV_CHIRPS) and os.path.getsize(CSV_CHIRPS) > 0:
+        print("✅ Cache hit: CHIRPS CSV exists.")
+        return CSV_CHIRPS
+
+    chirps_ic = ee.ImageCollection(CHIRPS_ID)
+    chirps_last = ee.Date(
+        chirps_ic.sort("system:time_start", False).first().get("system:time_start")
+    ).format("YYYY-MM-dd").getInfo()
+    print("✅ CHIRPS last available (GEE):", chirps_last)
+
+    start_year = pd.to_datetime(START_DATE).year
+    end_year = pd.to_datetime(chirps_last).year
+
+    paths = []
+    for year in range(start_year, end_year + 1):
+        pth = fetch_chirps_year_to_csv(year, chirps_last)
+        if pth:
+            paths.append(pth)
+
+    dfs = []
+    for pth in paths:
+        df = pd.read_csv(pth)
+        if df.empty:
+            continue
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
+        dfs.append(df[["date", "precip_mm"]])
+
+    if not dfs:
+        raise RuntimeError("No CHIRPS yearly data were fetched.")
+
+    df_ch = pd.concat(dfs, ignore_index=True).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df_ch.to_csv(CSV_CHIRPS, index=False)
+
+    print("✅ CHIRPS CSV saved:", CSV_CHIRPS)
+    print(f"   Period: {df_ch['date'].min().date()} → {df_ch['date'].max().date()} | n={len(df_ch)}")
+    return CSV_CHIRPS
+
+# -----------------------
+# 8) IMERG daily via getInfo() MONTH-BY-MONTH
+# -----------------------
+def detect_imerg_rate_band(ic):
+    bnames = ic.first().bandNames().getInfo()
+    candidates = ["precipitation", "precipitationCal", "HQprecipitation", "precipitationUncal"]
+    for b in candidates:
+        if b in bnames:
+            return b
+    raise ValueError(f"IMERG precipitation band not found. Bands: {bnames}")
+
+def imerg_daily_fc(start, end):
+    ic0 = ee.ImageCollection(IMERG_ID).filterDate(start, end)
+    band = detect_imerg_rate_band(ic0)
+    ic = ic0.select([band])
+
+    def rate_to_mm_step(img):
+        t0 = ee.Date(img.get("system:time_start"))
+        has_end = img.propertyNames().contains("system:time_end")
+        t1 = ee.Date(ee.Algorithms.If(has_end, img.get("system:time_end"), t0.advance(30, "minute")))
+        dur_hr = t1.difference(t0, "hour")
+        dur_hr = ee.Number(ee.Algorithms.If(dur_hr.lte(0), 0.5, dur_hr))
+        return img.multiply(dur_hr).copyProperties(img, img.propertyNames())
+
+    ic_mm = ic.map(rate_to_mm_step)
+
+    start_d = ee.Date(start)
+    end_d   = ee.Date(end)
+    n_days = end_d.difference(start_d, "day").toInt()
+
+    def day_to_feat(k):
+        d0 = start_d.advance(k, "day")
+        d1 = d0.advance(1, "day")
+        day_ic = ic_mm.filterDate(d0, d1)
+        count = day_ic.size()
+        day_sum = day_ic.sum()
+
+        stat = ee.Dictionary(
+            ee.Algorithms.If(
+                count.gt(0),
+                day_sum.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=roi_geom,
+                    scale=10000,
+                    bestEffort=True,
+                    maxPixels=1e13
+                ),
+                ee.Dictionary({})
+            )
+        )
+
+        dstr = d0.format("YYYY-MM-dd")
+        precip_val = stat.get(band)
+        return ee.Feature(None, {"date": dstr, "precip_mm": precip_val, "count": count})
+
+    return ee.FeatureCollection(ee.List.sequence(0, n_days.subtract(1)).map(day_to_feat))
+
+def month_start_end(year, month, last_available):
+    start = pd.Timestamp(year=year, month=month, day=1)
+    last_day = calendar.monthrange(year, month)[1]
+    end = pd.Timestamp(year=year, month=month, day=last_day) + pd.Timedelta(days=1)
+
+    last_available = pd.to_datetime(last_available)
+    if start > last_available:
+        return None, None
+
+    end = min(end, last_available + pd.Timedelta(days=1))
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+def fetch_imerg_month_to_csv(year, month, imerg_last_date):
+    start, end = month_start_end(year, month, imerg_last_date)
+    if start is None:
+        return None
+
+    prefix = f"JDF_MUNIC_IMERG_daily_mean_{CACHE_TAG}_{year}_{month:02d}"
+    expected = os.path.join(OUT_DIR, f"{prefix}.csv")
+
+    if os.path.exists(expected) and os.path.getsize(expected) > 0:
+        print(f"✅ IMERG {year}-{month:02d} cache hit:", expected)
+        return expected
+
+    alt = find_latest_matching(OUT_DIR, prefix)
+    if alt and os.path.getsize(alt) > 0:
+        print(f"✅ IMERG {year}-{month:02d} using existing file:", alt)
+        return alt
+
+    print(f"⏳ Fetching IMERG {year}-{month:02d}: {start} → {end}")
+    fc = imerg_daily_fc(start, end)
+    info = fc.getInfo()
+    feats = info.get("features", [])
+
+    rows = []
+    for ft in feats:
+        props = ft.get("properties", {})
+        rows.append({
+            "date": props.get("date"),
+            "precip_mm": props.get("precip_mm"),
+            "count": props.get("count")
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["date", "precip_mm", "count"])
+
+    df.to_csv(expected, index=False)
+    print(f"✅ Saved IMERG month CSV: {expected} | n={len(df)}")
+    return expected
+
+def ensure_imerg_csv():
+    if os.path.exists(CSV_IMERG) and os.path.getsize(CSV_IMERG) > 0:
+        print("✅ Cache hit: IMERG CSV exists.")
+        return CSV_IMERG
+
+    imerg_ic = ee.ImageCollection(IMERG_ID)
+    imerg_last = ee.Date(
+        imerg_ic.sort("system:time_start", False).first().get("system:time_start")
+    ).format("YYYY-MM-dd").getInfo()
+    print("✅ IMERG last available (GEE):", imerg_last)
+
+    paths = []
+    for year in range(IMERG_START_YEAR, IMERG_END_YEAR + 1):
+        for month in range(1, 13):
+            pth = fetch_imerg_month_to_csv(year, month, imerg_last)
+            if pth:
+                paths.append(pth)
+
+    dfs = []
+    for pth in paths:
+        df = pd.read_csv(pth)
+        if df.empty:
+            continue
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
+        dfs.append(df[["date", "precip_mm"]])
+
+    if not dfs:
+        raise RuntimeError("No IMERG monthly data were fetched.")
+
+    df_im = pd.concat(dfs, ignore_index=True).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df_im.to_csv(CSV_IMERG, index=False)
+
+    print("✅ IMERG CSV saved:", CSV_IMERG)
+    print(f"   Period: {df_im['date'].min().date()} → {df_im['date'].max().date()} | n={len(df_im)}")
+    return CSV_IMERG
+
+# -----------------------
+# 9) Hybrid series
+# -----------------------
+def ensure_hybrid_csv():
+    if os.path.exists(CSV_HYBRID) and os.path.getsize(CSV_HYBRID) > 0:
+        print("✅ Cache hit: HYBRID CSV exists.")
+        df = pd.read_csv(CSV_HYBRID)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+        df = df.dropna(subset=["date","precip_mm"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+        return df
+
+    chirps_csv = ensure_chirps_csv()
+    imerg_csv  = ensure_imerg_csv()
+
+    df_ch = load_precip_csv(chirps_csv)
+    df_im = load_precip_csv(imerg_csv)
+
+    chirps_end = df_ch["date"].max()
+    df_im_after = df_im[df_im["date"] > chirps_end]
+
+    df_h = pd.concat([df_ch, df_im_after], ignore_index=True).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df_h.to_csv(CSV_HYBRID, index=False)
+
+    print("✅ HYBRID CSV saved:", CSV_HYBRID)
+    print(f"   Period: {df_h['date'].min().date()} → {df_h['date'].max().date()} | n={len(df_h)}")
+    return df_h
+
+# -----------------------
+# 10) ETCCDI-like indices + ranking
+# -----------------------
+WET_DAY_MM = 1.0
+R10 = 10.0
+R20 = 20.0
+
+def longest_run(bool_arr):
+    max_run = run = 0
+    for v in bool_arr:
+        if v:
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    return max_run
+
+def annual_indices(series: pd.Series, p95_thr: float, p99_thr: float) -> pd.DataFrame:
+    df = series.to_frame("p").copy()
+    df["year"] = df.index.year
+    df["roll5"] = df["p"].rolling(5).sum()
+
+    out = []
+    for y, g in df.groupby("year"):
+        px = g["p"].values
+        rx1 = float(np.nanmax(px)) if len(px) else np.nan
+        rx5 = float(np.nanmax(g["roll5"].values)) if len(g) else np.nan
+        r10 = int(np.sum(px >= R10))
+        r20 = int(np.sum(px >= R20))
+        cdd = int(longest_run(px < WET_DAY_MM))
+        cwd = int(longest_run(px >= WET_DAY_MM))
+        r95p = float(np.nansum(px[px > p95_thr]))
+        r99p = float(np.nansum(px[px > p99_thr]))
+        prcptot = float(np.nansum(px[px >= WET_DAY_MM]))
+        sdii = float(prcptot / max(np.sum(px >= WET_DAY_MM), 1))
+        out.append([y, rx1, rx5, r10, r20, cdd, cwd, r95p, r99p, prcptot, sdii])
+
+    cols = ["year","Rx1day","Rx5day","R10mm","R20mm","CDD","CWD","R95p","R99p","PRCPTOT","SDII"]
+    return pd.DataFrame(out, columns=cols).set_index("year")
+
+def rolling_rank(series: pd.Series, window_days: int, event_end: str):
+    roll = series.rolling(window_days).sum().dropna()
+    e_end = pd.to_datetime(event_end)
+    if e_end not in roll.index:
+        return {"window": window_days, "event_value": np.nan, "rank": np.nan, "n": int(len(roll)),
+                "percentile": np.nan, "emp_return_period_yr": np.nan}
+
+    ev = float(roll.loc[e_end])
+    sorted_vals = np.sort(roll.values)[::-1]
+    rank = int(np.searchsorted(-sorted_vals, -ev) + 1)
+    n = int(len(sorted_vals))
+    pct = float(stats.percentileofscore(roll.values, ev, kind="weak"))
+    rp_years = float(((n + 1) / rank) / 365.25)
+    return {"window": window_days, "event_value": ev, "rank": rank, "n": n,
+            "percentile": pct, "emp_return_period_yr": rp_years}
+
+def classify_event(ranks_df: pd.DataFrame) -> str:
+    best = ranks_df.dropna(subset=["percentile","rank"]).copy()
+    if best.empty:
+        return "UNCLASSIFIED (event not covered in extracted series)"
+    best = best.sort_values(["percentile","rank"], ascending=[False, True]).iloc[0]
+    pct, rk = best["percentile"], best["rank"]
+    if (pct >= 99.5) or (rk <= 5):
+        return "EXTREME / EXCEPTIONAL (near-unprecedented)"
+    if (pct >= 99.0) or (rk <= 20):
+        return "VERY RARE (upper tail)"
+    if (pct >= 97.5) or (rk <= 50):
+        return "RARE (statistically unusual)"
+    return "NOT RARE (precipitation-only criteria)"
+
+def ensure_indices_and_ranking(p: pd.Series):
+    if os.path.exists(CSV_INDICES) and os.path.getsize(CSV_INDICES) > 0 and \
+       os.path.exists(CSV_RANKS) and os.path.getsize(CSV_RANKS) > 0:
+        print("✅ Cache hit: Using existing indices/ranking CSVs.")
+        ann = pd.read_csv(CSV_INDICES, index_col=0)
+        ranks = pd.read_csv(CSV_RANKS)
+        return ann, ranks
+
+    baseline = p.loc[BASELINE_START:BASELINE_END]
+    p95_base = np.nanpercentile(baseline.values, 95)
+    p99_base = np.nanpercentile(baseline.values, 99)
+
+    ann = annual_indices(p, p95_base, p99_base)
+    ranks = pd.DataFrame([
+        rolling_rank(p, 1, EVENT_END),
+        rolling_rank(p, 2, EVENT_END),
+        rolling_rank(p, 3, EVENT_END),
+        rolling_rank(p, 5, EVENT_END),
+        rolling_rank(p, 7, EVENT_END),
+    ])
+
+    ann.to_csv(CSV_INDICES)
+    ranks.to_csv(CSV_RANKS, index=False)
+
+    print("✅ Indices saved:", CSV_INDICES)
+    print("✅ Ranking saved:", CSV_RANKS)
+    return ann, ranks
+
+# -----------------------
+# 11) Spatial products
+# -----------------------
+def imerg_event_total_image(event_start, event_end):
+    ic0 = ee.ImageCollection(IMERG_ID).filterDate(
+        event_start, (pd.to_datetime(event_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    )
+    band = detect_imerg_rate_band(ic0)
+    ic = ic0.select([band])
+
+    def rate_to_mm_step(img):
+        t0 = ee.Date(img.get("system:time_start"))
+        has_end = img.propertyNames().contains("system:time_end")
+        t1 = ee.Date(ee.Algorithms.If(has_end, img.get("system:time_end"), t0.advance(30, "minute")))
+        dur_hr = t1.difference(t0, "hour")
+        dur_hr = ee.Number(ee.Algorithms.If(dur_hr.lte(0), 0.5, dur_hr))
+        return img.multiply(dur_hr).rename("event_mm")
+
+    return ic.map(rate_to_mm_step).sum().rename("event_mm").clip(roi_geom)
+
+def chirps_baseline_eventwindow_ic(event_start, event_end, baseline_start, baseline_end):
+    event_start = pd.to_datetime(event_start)
+    event_end   = pd.to_datetime(event_end)
+    month0, day0 = event_start.month, event_start.day
+    month1, day1 = event_end.month, event_end.day
+
+    start_year = pd.to_datetime(baseline_start).year
+    end_year   = pd.to_datetime(baseline_end).year
+
+    imgs = []
+    for y in range(start_year, end_year + 1):
+        s = pd.Timestamp(year=y, month=month0, day=day0).strftime("%Y-%m-%d")
+        e = (pd.Timestamp(year=y, month=month1, day=day1) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        img = ee.ImageCollection(CHIRPS_ID).filterDate(s, e).select("precipitation").sum().rename("clim_mm")
+        imgs.append(img)
+
+    return ee.ImageCollection(imgs)
+
+def build_spatial_products():
+    event_img = imerg_event_total_image(EVENT_START, EVENT_END)
+    clim_ic = chirps_baseline_eventwindow_ic(EVENT_START, EVENT_END, BASELINE_START, BASELINE_END)
+
+    clim_mean = clim_ic.mean().rename("clim_mean")
+    clim_std  = clim_ic.reduce(ee.Reducer.stdDev()).rename("clim_std")
+
+    chirps_ref = ee.ImageCollection(CHIRPS_ID).first().select("precipitation")
+    event_on_chirps = event_img.resample("bilinear").reproject(chirps_ref.projection()).rename("event_mm")
+
+    anomaly = event_on_chirps.subtract(clim_mean).rename("anomaly")
+    zscore  = anomaly.divide(clim_std).rename("zscore").updateMask(clim_std.gt(0))
+
+    n = ee.Number(clim_ic.size())
+    percentile = clim_ic.map(lambda img: img.lte(event_on_chirps).rename("le")).sum() \
+                        .divide(n).multiply(100).rename("percentile")
+
+    return {
+        "event": event_on_chirps.clip(roi_geom),
+        "clim_mean": clim_mean.clip(roi_geom),
+        "anomaly": anomaly.clip(roi_geom),
+        "zscore": zscore.clip(roi_geom),
+        "percentile": percentile.clip(roi_geom)
+    }
+
+def export_spatial_rasters():
+    if all(os.path.exists(p) and os.path.getsize(p) > 0 for p in [
+        RASTER_EVENT_TIF, RASTER_CLIM_MEAN_TIF, RASTER_ANOM_TIF, RASTER_ZSCORE_TIF, RASTER_PERCENTILE_TIF
+    ]):
+        print("✅ Cache hit: Spatial rasters already exist.")
+        return
+
+    imgs = build_spatial_products()
+
+    geemap.ee_export_image(imgs["event"], filename=RASTER_EVENT_TIF, scale=5500, region=roi_geom.bounds(), file_per_band=False)
+    geemap.ee_export_image(imgs["clim_mean"], filename=RASTER_CLIM_MEAN_TIF, scale=5500, region=roi_geom.bounds(), file_per_band=False)
+    geemap.ee_export_image(imgs["anomaly"], filename=RASTER_ANOM_TIF, scale=5500, region=roi_geom.bounds(), file_per_band=False)
+    geemap.ee_export_image(imgs["zscore"], filename=RASTER_ZSCORE_TIF, scale=5500, region=roi_geom.bounds(), file_per_band=False)
+    geemap.ee_export_image(imgs["percentile"], filename=RASTER_PERCENTILE_TIF, scale=5500, region=roi_geom.bounds(), file_per_band=False)
+
+    print("✅ Spatial rasters exported.")
+
+# -----------------------
+# 12) Spatial indices
+# -----------------------
+def compute_spatial_indices(save_csv=True):
+    export_spatial_rasters()
+
+    arr_event, _ = read_clip_raster(RASTER_EVENT_TIF, gdf_roi)
+    arr_clim, _  = read_clip_raster(RASTER_CLIM_MEAN_TIF, gdf_roi)
+    arr_anom, _  = read_clip_raster(RASTER_ANOM_TIF, gdf_roi)
+    arr_z, _     = read_clip_raster(RASTER_ZSCORE_TIF, gdf_roi)
+    arr_pct, _   = read_clip_raster(RASTER_PERCENTILE_TIF, gdf_roi)
+
+    st_event = finite_stats(arr_event)
+    st_clim  = finite_stats(arr_clim)
+    st_anom  = finite_stats(arr_anom)
+    st_z     = finite_stats(arr_z)
+    st_pct   = finite_stats(arr_pct)
+
+    rows = [
+        ["Event accumulation mean (mm)", st_event["mean"]],
+        ["Event accumulation max (mm)", st_event["max"]],
+        ["Event accumulation std (mm)", st_event["std"]],
+        ["Event accumulation CV (%)", st_event["cv_pct"]],
+        ["Climatology mean (mm)", st_clim["mean"]],
+        ["Climatology max (mm)", st_clim["max"]],
+        ["Anomaly mean (mm)", st_anom["mean"]],
+        ["Anomaly max (mm)", st_anom["max"]],
+        ["Positive anomaly area (%)", frac_gt(arr_anom, 0)],
+        ["Area with anomaly >= 20 mm (%)", frac_ge(arr_anom, 20)],
+        ["Area with anomaly >= 30 mm (%)", frac_ge(arr_anom, 30)],
+        ["Z-score mean", st_z["mean"]],
+        ["Z-score max", st_z["max"]],
+        ["Area with z-score >= 1 (%)", frac_ge(arr_z, 1)],
+        ["Area with z-score >= 2 (%)", frac_ge(arr_z, 2)],
+        ["Area with z-score >= 3 (%)", frac_ge(arr_z, 3)],
+        ["Percentile mean", st_pct["mean"]],
+        ["Percentile min", st_pct["min"]],
+        ["Percentile max", st_pct["max"]],
+        ["Area with percentile >= 90 (%)", frac_ge(arr_pct, 90)],
+        ["Area with percentile >= 95 (%)", frac_ge(arr_pct, 95)],
+        ["Area with percentile >= 99 (%)", frac_ge(arr_pct, 99)],
+    ]
+
+    df = pd.DataFrame(rows, columns=["metric", "value"])
+    if save_csv:
+        df.to_csv(CSV_SPATIAL_STATS, index=False)
+        print("✅ Spatial indices CSV saved:", CSV_SPATIAL_STATS)
+    return df
+
+# -----------------------
+# 13) Figures
+# -----------------------
+def make_composite_figure(p: pd.Series, ann: pd.DataFrame, ranks: pd.DataFrame, out_path: str, dpi: int = 500):
+    fig = plt.figure(figsize=(16, 12))
+    gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.35, wspace=0.25,
+                           height_ratios=[1.2, 1, 1, 1])
+
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.bar(p.index, p.values, width=1, color=COLORS["primary"], alpha=0.6, linewidth=0, label="Daily precipitation")
+    event_mask = (p.index >= pd.to_datetime(EVENT_START)) & (p.index <= pd.to_datetime(EVENT_END))
+    if event_mask.any():
+        ax1.bar(p.index[event_mask], p.values[event_mask], width=1,
+                color=COLORS["danger"], alpha=0.85, linewidth=0,
+                label=f"Event ({EVENT_START} to {EVENT_END})")
+    ax1.set_ylabel("Precipitation (mm/day)")
+    ax1.set_title("A) Daily Municipality-Mean Precipitation — Juiz de Fora (1981–present)",
+                  fontweight="bold", loc="left")
+    ax1.grid(True, alpha=0.3, linestyle="--")
+    ax1.legend(loc="upper right", framealpha=0.9)
+
+    ax2 = fig.add_subplot(gs[1, 0])
+    zoom_start = pd.to_datetime(EVENT_START) - pd.Timedelta(days=10)
+    zoom_end   = pd.to_datetime(EVENT_END) + pd.Timedelta(days=10)
+    pz = p.loc[zoom_start:zoom_end]
+    ax2.bar(pz.index, pz.values, width=0.8, color=COLORS["info"], alpha=0.7)
+    ez = pz.loc[EVENT_START:EVENT_END]
+    if not ez.empty:
+        ax2.bar(ez.index, ez.values, width=0.8, color=COLORS["danger"], alpha=0.9)
+        ax2.axvspan(pd.to_datetime(EVENT_START), pd.to_datetime(EVENT_END), color=COLORS["danger"], alpha=0.1)
+    ax2.set_title("B) Event Detail (±10 days)", fontweight="bold", loc="left")
+    ax2.set_ylabel("Precipitation (mm/day)")
+    ax2.grid(True, alpha=0.3)
+    ax2.tick_params(axis='x', rotation=45)
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.plot(ann.index, ann["PRCPTOT"], color=COLORS["primary"], marker="o", markersize=3, linewidth=1)
+    ax3.set_title("C) Annual PRCPTOT", fontweight="bold", loc="left")
+    ax3.set_ylabel("mm/year")
+    ax3.set_xlabel("Year")
+    ax3.grid(True, alpha=0.3)
+
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.plot(ann.index, ann["Rx1day"], color=COLORS["secondary"], marker="o", markersize=3, linewidth=1)
+    ax4.set_title("D) Annual Rx1day", fontweight="bold", loc="left")
+    ax4.set_ylabel("mm")
+    ax4.set_xlabel("Year")
+    ax4.grid(True, alpha=0.3)
+
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.plot(ann.index, ann["Rx5day"], color=COLORS["info"], marker="o", markersize=3, linewidth=1)
+    ax5.set_title("E) Annual Rx5day", fontweight="bold", loc="left")
+    ax5.set_ylabel("mm")
+    ax5.set_xlabel("Year")
+    ax5.grid(True, alpha=0.3)
+
+    ax6 = fig.add_subplot(gs[3, :])
+    windows = ranks["window"].values
+    percentiles = ranks["percentile"].values
+    colors_bar = [COLORS["danger"] if pctl >= 99 else COLORS["warning"] if pctl >= 95 else COLORS["info"] for pctl in percentiles]
+    ax6.barh(range(len(windows)), percentiles, color=colors_bar, alpha=0.75)
+    ax6.set_yticks(range(len(windows)))
+    ax6.set_yticklabels([f"{int(w)}-day" for w in windows])
+    ax6.set_xlabel("Percentile (%)")
+    ax6.set_xlim(0, 100)
+    ax6.set_title("F) Event Historical Ranking (Accumulations)", fontweight="bold", loc="left")
+    ax6.axvline(95, color="gray", linestyle="--", linewidth=1)
+    ax6.axvline(99, color="red", linestyle="--", linewidth=1)
+    ax6.grid(True, alpha=0.3, axis="x")
+    for i, (pct, rk) in enumerate(zip(ranks["percentile"], ranks["rank"])):
+        if pd.notna(pct) and pd.notna(rk):
+            ax6.text(pct + 1, i, f"Rank {int(rk)}", va="center", fontsize=7)
+
+    plt.suptitle("Juiz de Fora Municipality — Temporal Analysis Panel", fontsize=14, fontweight="bold", y=0.995)
+    plt.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close()
+    print(f"✅ Composite figure saved: {out_path}")
+
+def make_etccdi_panel(ann: pd.DataFrame, out_path: str, dpi: int = 500):
+    metrics = [
+        ("Rx1day", "Annual maximum 1-day precipitation (mm)"),
+        ("Rx5day", "Annual maximum 5-day precipitation (mm)"),
+        ("R10mm", "Days ≥ 10 mm"),
+        ("R20mm", "Days ≥ 20 mm"),
+        ("CDD", "Consecutive dry days"),
+        ("CWD", "Consecutive wet days"),
+        ("PRCPTOT", "Annual wet-day total (mm)"),
+        ("SDII", "Simple daily intensity index"),
+    ]
+
+    fig, axes = plt.subplots(4, 2, figsize=(14, 12))
+    axes = axes.ravel()
+
+    for ax, (col, title) in zip(axes, metrics):
+        y = ann[col].values
+        x = ann.index.values
+
+        ax.plot(x, y, color=COLORS["primary"], marker="o", markersize=3, linewidth=1)
+        if len(x) > 1 and np.isfinite(y).sum() >= 2:
+            z = np.polyfit(x[np.isfinite(y)], y[np.isfinite(y)], 1)
+            pfit = np.poly1d(z)
+            ax.plot(x, pfit(x), "--", color=COLORS["danger"], linewidth=1.2, alpha=0.7)
+
+        if 2026 in ann.index:
+            ax.scatter([2026], [ann.loc[2026, col]], color=COLORS["danger"], s=35, zorder=10, label="2026")
+            ax.legend(loc="best", framealpha=0.9)
+
+        ax.set_title(title, fontweight="bold", loc="left")
+        ax.set_xlabel("Year")
+        ax.set_ylabel(col)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Juiz de Fora Municipality — ETCCDI-like Annual Indices", fontsize=14, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close()
+    print(f"✅ ETCCDI panel saved: {out_path}")
+
+def plot_event_boxplots(p: pd.Series, event_start: str, event_end: str, out_tif: str, dpi: int = 500):
+    windows = [1, 2, 3, 5, 7]
+    event_end_dt = pd.to_datetime(event_end)
+
+    fig, axes = plt.subplots(1, len(windows), figsize=(16, 5), sharey=False)
+
+    for idx, window in enumerate(windows):
+        ax = axes[idx]
+        roll = p.rolling(window).sum().dropna()
+        event_val = roll.loc[event_end_dt] if event_end_dt in roll.index else np.nan
+
+        ax.boxplot([roll.values], widths=0.6, patch_artist=True,
+                   boxprops=dict(facecolor=COLORS["primary"], alpha=0.5),
+                   medianprops=dict(color='red', linewidth=2),
+                   whiskerprops=dict(linewidth=1.5),
+                   capprops=dict(linewidth=1.5))
+
+        if not np.isnan(event_val):
+            ax.plot(1, event_val, 'D', color=COLORS["danger"], markersize=10,
+                    label=f"Event: {event_val:.1f} mm", zorder=10)
+            pct = stats.percentileofscore(roll.values, event_val, kind="weak")
+            rank = int(np.searchsorted(-np.sort(roll.values)[::-1], -event_val) + 1)
+            ax.text(1.15, event_val, f"{pct:.1f}%\n(Rank {rank})", fontsize=8, va='center')
+
+        ax.set_title(f"{window}-day accumulation", fontweight="bold")
+        ax.set_ylabel("Precipitation (mm)" if idx == 0 else "")
+        ax.set_xticks([])
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.legend(loc="upper right", fontsize=7)
+
+    plt.suptitle(f"Event Position in Historical Distribution — Municipality mean — Event: {event_start} to {event_end}",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_tif, dpi=dpi, bbox_inches="tight", facecolor='white')
+    plt.show()
+    plt.close()
+    print(f"✅ Boxplot panel saved: {out_tif}")
+
+def make_monthly_boxplot_panel(p: pd.Series, out_tif: str, dpi: int = 500):
+    df = p.to_frame("precip_mm").copy()
+    df["month"] = df.index.month
+    df["year"] = df.index.year
+
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    month_data = [df.loc[df["month"] == m, "precip_mm"].dropna().values for m in range(1, 13)]
+
+    feb2026 = df.loc[(df["year"] == 2026) & (df["month"] == 2), "precip_mm"].dropna()
+    feb_event_daily = df.loc[(df.index >= pd.to_datetime(EVENT_START)) & (df.index <= pd.to_datetime(EVENT_END)), "precip_mm"].dropna()
+    feb_event_sum = float(feb_event_daily.sum()) if len(feb_event_daily) else np.nan
+    feb_event_max = float(feb_event_daily.max()) if len(feb_event_daily) else np.nan
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), gridspec_kw={"width_ratios":[2.3, 1]})
+
+    # A) Monthly daily distributions
+    ax = axes[0]
+    bp = ax.boxplot(
+        month_data,
+        patch_artist=True,
+        widths=0.6,
+        showfliers=True,
+        medianprops=dict(color="red", linewidth=1.8),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(COLORS["primary"])
+        patch.set_alpha(0.45)
+
+    # Highlight all Feb 2026 daily values on February box
+    if len(feb2026) > 0:
+        xvals = np.full(len(feb2026), 2.0)
+        ax.scatter(
+            xvals, feb2026.values,
+            s=40, marker="o", color=COLORS["danger"],
+            edgecolor="black", linewidth=0.5, zorder=10,
+            label="Feb/2026 daily values"
+        )
+
+    # Highlight event days specifically
+    if len(feb_event_daily) > 0:
+        xvals2 = np.full(len(feb_event_daily), 2.0)
+        ax.scatter(
+            xvals2, feb_event_daily.values,
+            s=75, marker="D", color=COLORS["warning"],
+            edgecolor="black", linewidth=0.8, zorder=11,
+            label="Event days (22–24 Feb 2026)"
+        )
+
+        for d, v in feb_event_daily.items():
+            ax.text(2.14, v, d.strftime("%d-%b"), fontsize=8, va="center")
+
+    ax.set_xticks(range(1, 13))
+    ax.set_xticklabels(month_labels)
+    ax.set_ylabel("Daily precipitation (mm)")
+    ax.set_title("A) Monthly daily precipitation distributions\nFeb/2026 and event days highlighted", fontweight="bold", loc="left")
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(loc="upper right", framealpha=0.95)
+
+    # B) Feb/2026 event summary vs historical February distribution
+    ax2 = axes[1]
+    feb_hist = df.loc[df["month"] == 2, "precip_mm"].dropna().values
+    ax2.boxplot(
+        [feb_hist],
+        patch_artist=True,
+        widths=0.5,
+        showfliers=True,
+        boxprops=dict(facecolor=COLORS["info"], alpha=0.45),
+        medianprops=dict(color="red", linewidth=1.8),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+    )
+
+    if np.isfinite(feb_event_max):
+        pct_daily = stats.percentileofscore(feb_hist, feb_event_max, kind="weak")
+        rk_daily = int(np.searchsorted(-np.sort(feb_hist)[::-1], -feb_event_max) + 1)
+        ax2.scatter([1], [feb_event_max], s=130, marker="D", color=COLORS["danger"],
+                    edgecolor="black", linewidth=0.8, zorder=10)
+        ax2.text(
+            1.12, feb_event_max,
+            f"Max event day = {feb_event_max:.1f} mm\nPct = {pct_daily:.1f}\nRank = {rk_daily}",
+            fontsize=8, va="center"
+        )
+
+    ax2.set_xticks([1])
+    ax2.set_xticklabels(["All February days\n(1981–present)"])
+    ax2.set_ylabel("Daily precipitation (mm)")
+    ax2.set_title("B) Position of Feb/2026 event within\nhistorical February daily distribution", fontweight="bold", loc="left")
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle(
+        f"Juiz de Fora Municipality — Monthly Boxplots and February 2026 Event Position\n"
+        f"Event total (22–24 Feb 2026) = {feb_event_sum:.1f} mm | Event max daily = {feb_event_max:.1f} mm",
+        fontsize=13, fontweight="bold", y=0.99
+    )
+    plt.tight_layout()
+    plt.savefig(out_tif, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close()
+    print(f"✅ Monthly boxplot panel saved: {out_tif}")
+
+def make_spatial_panel(out_tif: str, dpi: int = 500):
+    export_spatial_rasters()
+
+    arr_event, ext_event = read_clip_raster(RASTER_EVENT_TIF, gdf_roi)
+    arr_clim, ext_clim   = read_clip_raster(RASTER_CLIM_MEAN_TIF, gdf_roi)
+    arr_anom, ext_anom   = read_clip_raster(RASTER_ANOM_TIF, gdf_roi)
+    arr_z, ext_z         = read_clip_raster(RASTER_ZSCORE_TIF, gdf_roi)
+    arr_pct, ext_pct     = read_clip_raster(RASTER_PERCENTILE_TIF, gdf_roi)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    axes = axes.ravel()
+
+    im1 = axes[0].imshow(arr_event, extent=ext_event, origin="upper", cmap="Blues")
+    gdf_roi.boundary.plot(ax=axes[0], color="black", linewidth=1.2)
+    axes[0].set_title("A) Event accumulation (mm)", fontweight="bold", loc="left")
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+    im2 = axes[1].imshow(arr_clim, extent=ext_clim, origin="upper", cmap="Blues")
+    gdf_roi.boundary.plot(ax=axes[1], color="black", linewidth=1.2)
+    axes[1].set_title("B) Baseline climatology", fontweight="bold", loc="left")
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+    vmax_anom = np.nanmax(np.abs(arr_anom))
+    norm_anom = TwoSlopeNorm(vmin=-vmax_anom, vcenter=0, vmax=vmax_anom) if np.isfinite(vmax_anom) and vmax_anom > 0 else None
+    im3 = axes[2].imshow(arr_anom, extent=ext_anom, origin="upper", cmap="RdBu_r", norm=norm_anom)
+    gdf_roi.boundary.plot(ax=axes[2], color="black", linewidth=1.2)
+    axes[2].set_title("C) Anomaly", fontweight="bold", loc="left")
+    plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+    vmax_z = np.nanmax(np.abs(arr_z))
+    norm_z = TwoSlopeNorm(vmin=-vmax_z, vcenter=0, vmax=vmax_z) if np.isfinite(vmax_z) and vmax_z > 0 else None
+    im4 = axes[3].imshow(arr_z, extent=ext_z, origin="upper", cmap="RdBu_r", norm=norm_z)
+    gdf_roi.boundary.plot(ax=axes[3], color="black", linewidth=1.2)
+    axes[3].set_title("D) Z-score", fontweight="bold", loc="left")
+    plt.colorbar(im4, ax=axes[3], fraction=0.046, pad=0.04)
+
+    im5 = axes[4].imshow(arr_pct, extent=ext_pct, origin="upper", cmap="viridis", vmin=0, vmax=100)
+    gdf_roi.boundary.plot(ax=axes[4], color="black", linewidth=1.2)
+    axes[4].set_title("E) Event percentile", fontweight="bold", loc="left")
+    plt.colorbar(im5, ax=axes[4], fraction=0.046, pad=0.04)
+
+    axes[5].axis("off")
+    txt = (
+        f"Juiz de Fora municipality — spatial rainfall panel\n\n"
+        f"Event: {EVENT_START} to {EVENT_END}\n"
+        f"Baseline: {BASELINE_START} to {BASELINE_END}\n\n"
+        f"A) Event accumulation\n"
+        f"B) Baseline climatology\n"
+        f"C) Anomaly\n"
+        f"D) Z-score\n"
+        f"E) Event percentile\n\n"
+        f"All spatial analyses were clipped and interpreted\n"
+        f"using ONLY the municipal boundary."
+    )
+    axes[5].text(0.02, 0.98, txt, va="top", ha="left", fontsize=10)
+
+    for ax in axes[:5]:
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.grid(False)
+
+    plt.suptitle("Juiz de Fora Municipality — Spatial Rainfall Analysis", fontsize=14, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(out_tif, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close()
+    print(f"✅ Spatial panel saved: {out_tif}")
+
+def make_spatial_indices_panel(spatial_df: pd.DataFrame, out_tif: str, dpi: int = 500):
+    vals = dict(zip(spatial_df["metric"], spatial_df["value"]))
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+
+    labels_a = ["Event mean", "Event max", "Clim mean", "Clim max", "Anom mean", "Anom max"]
+    values_a = [
+        vals.get("Event accumulation mean (mm)", np.nan),
+        vals.get("Event accumulation max (mm)", np.nan),
+        vals.get("Climatology mean (mm)", np.nan),
+        vals.get("Climatology max (mm)", np.nan),
+        vals.get("Anomaly mean (mm)", np.nan),
+        vals.get("Anomaly max (mm)", np.nan),
+    ]
+    axes[0].bar(labels_a, values_a, color=[COLORS["primary"], COLORS["primary"], COLORS["info"], COLORS["info"], COLORS["danger"], COLORS["danger"]])
+    axes[0].set_title("A) Main spatial magnitudes", fontweight="bold", loc="left")
+    axes[0].set_ylabel("mm")
+    axes[0].tick_params(axis='x', rotation=30)
+    axes[0].grid(True, alpha=0.3, axis="y")
+
+    labels_b = ["Anom>0", "Anom≥20", "Anom≥30", "Z≥1", "Z≥2", "Z≥3"]
+    values_b = [
+        vals.get("Positive anomaly area (%)", np.nan),
+        vals.get("Area with anomaly >= 20 mm (%)", np.nan),
+        vals.get("Area with anomaly >= 30 mm (%)", np.nan),
+        vals.get("Area with z-score >= 1 (%)", np.nan),
+        vals.get("Area with z-score >= 2 (%)", np.nan),
+        vals.get("Area with z-score >= 3 (%)", np.nan),
+    ]
+    axes[1].bar(labels_b, values_b, color=[COLORS["danger"]]*3 + [COLORS["secondary"]]*3)
+    axes[1].set_title("B) Spatial exceedance fractions", fontweight="bold", loc="left")
+    axes[1].set_ylabel("Area (%)")
+    axes[1].set_ylim(0, 100)
+    axes[1].tick_params(axis='x', rotation=25)
+    axes[1].grid(True, alpha=0.3, axis="y")
+
+    labels_c = ["Pct mean", "Pct min", "Pct max", "Area≥90", "Area≥95", "Area≥99"]
+    values_c = [
+        vals.get("Percentile mean", np.nan),
+        vals.get("Percentile min", np.nan),
+        vals.get("Percentile max", np.nan),
+        vals.get("Area with percentile >= 90 (%)", np.nan),
+        vals.get("Area with percentile >= 95 (%)", np.nan),
+        vals.get("Area with percentile >= 99 (%)", np.nan),
+    ]
+    axes[2].bar(labels_c, values_c, color=[COLORS["green"]]*6)
+    axes[2].set_title("C) Spatial percentile metrics", fontweight="bold", loc="left")
+    axes[2].set_ylabel("Value / Area (%)")
+    axes[2].set_ylim(0, 100)
+    axes[2].tick_params(axis='x', rotation=25)
+    axes[2].grid(True, alpha=0.3, axis="y")
+
+    axes[3].axis("off")
+    txt = (
+        f"Juiz de Fora municipality — main spatial indices\n\n"
+        f"Event mean = {vals.get('Event accumulation mean (mm)', np.nan):.2f} mm\n"
+        f"Event max = {vals.get('Event accumulation max (mm)', np.nan):.2f} mm\n"
+        f"CV = {vals.get('Event accumulation CV (%)', np.nan):.2f} %\n"
+        f"Anomaly mean = {vals.get('Anomaly mean (mm)', np.nan):.2f} mm\n"
+        f"Anomaly max = {vals.get('Anomaly max (mm)', np.nan):.2f} mm\n"
+        f"Z-score mean = {vals.get('Z-score mean', np.nan):.2f}\n"
+        f"Z-score max = {vals.get('Z-score max', np.nan):.2f}\n"
+        f"Percentile mean = {vals.get('Percentile mean', np.nan):.2f}\n"
+        f"Area ≥ 95th pct = {vals.get('Area with percentile >= 95 (%)', np.nan):.2f} %\n"
+        f"Area ≥ 99th pct = {vals.get('Area with percentile >= 99 (%)', np.nan):.2f} %"
+    )
+    axes[3].text(0.02, 0.98, txt, va="top", ha="left", fontsize=11)
+
+    plt.suptitle("Juiz de Fora Municipality — Main Spatial Indices Panel", fontsize=14, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(out_tif, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close()
+    print(f"✅ Spatial indices panel saved: {out_tif}")
+
+def save_summary_table_figure(p: pd.Series, ann: pd.DataFrame, ranks: pd.DataFrame, spatial_df: pd.DataFrame, out_path: str, dpi: int = 500):
+    fig, ax = plt.subplots(figsize=(14, 11))
+    ax.axis('tight')
+    ax.axis('off')
+
+    event_mask = (p.index >= pd.to_datetime(EVENT_START)) & (p.index <= pd.to_datetime(EVENT_END))
+    event_total = float(p[event_mask].sum()) if event_mask.any() else np.nan
+    event_max = float(p[event_mask].max()) if event_mask.any() else np.nan
+    classification = classify_event(ranks)
+
+    sval = dict(zip(spatial_df["metric"], spatial_df["value"]))
+
+    rows = [
+        ["METRIC", "VALUE", "NOTES"],
+        ["Dataset coverage", f"{p.index[0].date()} to {p.index[-1].date()}", f"{len(p)} daily values"],
+        ["Event period", f"{EVENT_START} to {EVENT_END}", ""],
+        ["Event total (municipality mean, daily)", f"{event_total:.2f} mm", ""],
+        ["Event maximum daily", f"{event_max:.2f} mm", ""],
+        ["Classification", classification, "precipitation-only"],
+        ["", "", ""],
+        ["ETCCDI-like index", "2026 value", "Long-term mean"],
+        ["Rx1day", f"{ann.loc[2026,'Rx1day']:.2f}" if 2026 in ann.index else "NA", f"{ann['Rx1day'].mean():.2f}"],
+        ["Rx5day", f"{ann.loc[2026,'Rx5day']:.2f}" if 2026 in ann.index else "NA", f"{ann['Rx5day'].mean():.2f}"],
+        ["R10mm", f"{ann.loc[2026,'R10mm']:.0f}" if 2026 in ann.index else "NA", f"{ann['R10mm'].mean():.2f}"],
+        ["R20mm", f"{ann.loc[2026,'R20mm']:.0f}" if 2026 in ann.index else "NA", f"{ann['R20mm'].mean():.2f}"],
+        ["CDD", f"{ann.loc[2026,'CDD']:.0f}" if 2026 in ann.index else "NA", f"{ann['CDD'].mean():.2f}"],
+        ["CWD", f"{ann.loc[2026,'CWD']:.0f}" if 2026 in ann.index else "NA", f"{ann['CWD'].mean():.2f}"],
+        ["PRCPTOT", f"{ann.loc[2026,'PRCPTOT']:.2f}" if 2026 in ann.index else "NA", f"{ann['PRCPTOT'].mean():.2f}"],
+        ["SDII", f"{ann.loc[2026,'SDII']:.2f}" if 2026 in ann.index else "NA", f"{ann['SDII'].mean():.2f}"],
+        ["", "", ""],
+        ["Main spatial index", "Value", "Unit"],
+        ["Event accumulation mean", f"{sval.get('Event accumulation mean (mm)', np.nan):.2f}", "mm"],
+        ["Event accumulation max", f"{sval.get('Event accumulation max (mm)', np.nan):.2f}", "mm"],
+        ["Anomaly mean", f"{sval.get('Anomaly mean (mm)', np.nan):.2f}", "mm"],
+        ["Anomaly max", f"{sval.get('Anomaly max (mm)', np.nan):.2f}", "mm"],
+        ["Z-score max", f"{sval.get('Z-score max', np.nan):.2f}", "-"],
+        ["Percentile mean", f"{sval.get('Percentile mean', np.nan):.2f}", "%"],
+        ["Area ≥ 95th percentile", f"{sval.get('Area with percentile >= 95 (%)', np.nan):.2f}", "%"],
+        ["Area ≥ 99th percentile", f"{sval.get('Area with percentile >= 99 (%)', np.nan):.2f}", "%"],
+    ]
+
+    table = ax.table(cellText=rows, cellLoc='left', loc='center', colWidths=[0.36, 0.26, 0.38])
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.75)
+
+    for i in range(3):
+        table[(0, i)].set_facecolor(COLORS["primary"])
+        table[(0, i)].set_text_props(weight='bold', color='white')
+
+    for ridx in [7, 17]:
+        for c in range(3):
+            table[(ridx, c)].set_facecolor("#e9f2fb")
+            table[(ridx, c)].set_text_props(weight='bold')
+
+    plt.title("Juiz de Fora Municipality — Summary Table", fontsize=13, fontweight="bold", pad=20)
+    plt.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor='white')
+    plt.show()
+    plt.close()
+    print(f"✅ Summary table saved: {out_path}")
+
+# -----------------------
+# 14) RUN
+# -----------------------
+print("\n" + "="*72)
+print("STARTING JUIZ DE FORA PRECIPITATION ANALYSIS PIPELINE (MUNICIPAL LIMIT ONLY)")
+print("="*72 + "\n")
+
+df_h = ensure_hybrid_csv()
+p = df_h.set_index("date")["precip_mm"].astype(float).sort_index()
+
+ann, ranks = ensure_indices_and_ranking(p)
+spatial_df = compute_spatial_indices(save_csv=True)
+
+classification = classify_event(ranks)
+
+print("\n" + "="*72)
+print("📌 HISTORICAL CLASSIFICATION (precipitation-only):")
+print(f"   {classification}")
+print("="*72 + "\n")
+
+print("📊 Generating figures...")
+make_composite_figure(p, ann, ranks, FIG_COMPOSITE_TIF, dpi=DPI)
+make_etccdi_panel(ann, FIG_ETCCDI_TIF, dpi=DPI)
+plot_event_boxplots(p, EVENT_START, EVENT_END, FIG_BOXPLOTS_TIF, dpi=DPI)
+make_monthly_boxplot_panel(p, FIG_MONTHLY_BOXPLOT_TIF, dpi=DPI)
+make_spatial_panel(FIG_SPATIAL_TIF, dpi=DPI)
+make_spatial_indices_panel(spatial_df, FIG_SPATIAL_INDICES_TIF, dpi=DPI)
+save_summary_table_figure(p, ann, ranks, spatial_df, FIG_TABLE_TIF, dpi=DPI)
+
+print("\n" + "="*72)
+print("✅ ALL DONE")
+print("="*72)
+print(f"\nOutputs saved in: {OUT_DIR}")
+
+print("\nDATA FILES:")
+print(f"  • CHIRPS CSV:              {CSV_CHIRPS}")
+print(f"  • IMERG CSV:               {CSV_IMERG}")
+print(f"  • HYBRID CSV:              {CSV_HYBRID}")
+print(f"  • INDICES CSV:             {CSV_INDICES}")
+print(f"  • RANKING CSV:             {CSV_RANKS}")
+print(f"  • SPATIAL STATS CSV:       {CSV_SPATIAL_STATS}")
+
+print("\nSPATIAL RASTERS:")
+print(f"  • Event:                   {RASTER_EVENT_TIF}")
+print(f"  • Climatology:             {RASTER_CLIM_MEAN_TIF}")
+print(f"  • Anomaly:                 {RASTER_ANOM_TIF}")
+print(f"  • Z-score:                 {RASTER_ZSCORE_TIF}")
+print(f"  • Percentile:              {RASTER_PERCENTILE_TIF}")
+
+print("\nFIGURE FILES:")
+print(f"  • Composite panel:         {FIG_COMPOSITE_TIF}")
+print(f"  • ETCCDI panel:            {FIG_ETCCDI_TIF}")
+print(f"  • Event boxplots panel:    {FIG_BOXPLOTS_TIF}")
+print(f"  • Monthly boxplots panel:  {FIG_MONTHLY_BOXPLOT_TIF}")
+print(f"  • Spatial panel:           {FIG_SPATIAL_TIF}")
+print(f"  • Spatial indices panel:   {FIG_SPATIAL_INDICES_TIF}")
+print(f"  • Summary table:           {FIG_TABLE_TIF}")
+
+print("\n⚠️ NOTE:")
+print("All temporal and spatial analyses in this version use ONLY the Juiz de Fora municipal limit.")
+print("The monthly boxplot panel explicitly shows how February 2026 and the 22–24 Feb event")
+print("position themselves within the historical February distribution.")
+print("="*72 + "\n")
