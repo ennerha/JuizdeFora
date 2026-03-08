@@ -1,0 +1,427 @@
+# ============================================================
+# JUIZ DE FORA — COMPLEMENTARY DISASTER ANALYSIS
+# ============================================================
+# Additional analyses for comprehensive disaster assessment:
+# 1) Intensity-Duration-Frequency (IDF) analysis
+# 2) Comparison with other historical extreme events
+# 3) Persistence and event sequence analysis
+# 4) Extreme value statistics (GEV, GPD)
+# 5) Climate extreme indices
+# 6) Temporal trend analysis
+# 7) Detailed seasonal analysis
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+from scipy.optimize import curve_fit
+import warnings
+warnings.filterwarnings("ignore")
+
+# -----------------------
+# CONFIG
+# -----------------------
+from google.colab import drive
+drive.mount("/content/drive", force_remount=False)
+
+DRIVE_MP = "/content/drive"
+MYDRIVE = f"{DRIVE_MP}/MyDrive"
+OUT_DIR = f"{MYDRIVE}/GEE_exports_JDF_MUNICIPAL"
+CACHE_TAG = "v7_municipality_monthly_boxplot"
+
+EVENT_START = pd.to_datetime("2026-02-22")
+EVENT_END   = pd.to_datetime("2026-02-24")
+
+CSV_HYBRID = f"{OUT_DIR}/JDF_MUNIC_daily_1981_present_hybrid_{CACHE_TAG}.csv"
+
+# Novos outputs
+CSV_IDF_ANALYSIS = f"{OUT_DIR}/JDF_MUNIC_IDF_analysis_{CACHE_TAG}.csv"
+CSV_EXTREME_EVENTS = f"{OUT_DIR}/JDF_MUNIC_extreme_events_catalog_{CACHE_TAG}.csv"
+CSV_CLIMATE_INDICES = f"{OUT_DIR}/JDF_MUNIC_climate_indices_{CACHE_TAG}.csv"
+CSV_TRENDS = f"{OUT_DIR}/JDF_MUNIC_temporal_trends_{CACHE_TAG}.csv"
+CSV_SEASONAL_STATS = f"{OUT_DIR}/JDF_MUNIC_seasonal_statistics_{CACHE_TAG}.csv"
+FIG_COMPREHENSIVE = f"{OUT_DIR}/FIG_JDF_MUNIC_disaster_comprehensive_panel_500dpi_{CACHE_TAG}.tif"
+
+DPI = 500
+plt.rcParams.update({
+    "savefig.dpi": DPI,
+    "figure.dpi": 150,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 8,
+})
+
+# -----------------------
+# LOAD DATA
+# -----------------------
+df = pd.read_csv(CSV_HYBRID)
+df["date"] = pd.to_datetime(df["date"])
+df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce")
+df = df.dropna().sort_values("date").drop_duplicates("date")
+
+p = df.set_index("date")["precip_mm"].sort_index()
+
+# -----------------------
+# 1) IDF ANALYSIS
+# -----------------------
+print("🔍 IDF Analysis (Intensity-Duration-Frequency)...")
+
+durations = [1, 2, 3, 5, 7, 10, 15, 30]
+return_periods = [2, 5, 10, 25, 50, 100]
+
+idf_results = []
+
+for duration in durations:
+    # Rolling max per year
+    rolling = p.rolling(duration).sum()
+    annual_max = rolling.groupby(rolling.index.year).max()
+    annual_max = annual_max[annual_max > 0].dropna()
+    
+    if len(annual_max) < 10:
+        continue
+    
+    # Fit GEV distribution
+    try:
+        params = stats.genextreme.fit(annual_max)
+        
+        for rp in return_periods:
+            # Calculate quantile for return period
+            prob = 1 - 1/rp
+            intensity = stats.genextreme.ppf(prob, *params)
+            
+            idf_results.append({
+                "duration_days": duration,
+                "return_period_years": rp,
+                "intensity_mm": intensity,
+                "intensity_mm_per_day": intensity / duration,
+            })
+    except:
+        continue
+
+df_idf = pd.DataFrame(idf_results)
+df_idf.to_csv(CSV_IDF_ANALYSIS, index=False)
+
+# -----------------------
+# 2) EXTREME EVENTS CATALOG
+# -----------------------
+print("🔍 Cataloging historical extreme events...")
+
+# Define thresholds (95th and 99th percentiles)
+threshold_p95 = p.quantile(0.95)
+threshold_p99 = p.quantile(0.99)
+
+extreme_events = []
+
+# 1-day events above P99
+extreme_1d = p[p > threshold_p99].sort_values(ascending=False).head(50)
+for date, val in extreme_1d.items():
+    extreme_events.append({
+        "date": date,
+        "duration_days": 1,
+        "accumulation_mm": val,
+        "percentile": stats.percentileofscore(p, val),
+        "return_period_approx_years": len(p) / (len(p[p >= val]) or 1) / 365.25,
+    })
+
+# 3-day events
+roll3 = p.rolling(3).sum()
+extreme_3d = roll3[roll3 > roll3.quantile(0.99)].sort_values(ascending=False).head(30)
+for date, val in extreme_3d.items():
+    extreme_events.append({
+        "date": date,
+        "duration_days": 3,
+        "accumulation_mm": val,
+        "percentile": stats.percentileofscore(roll3.dropna(), val),
+        "return_period_approx_years": len(roll3.dropna()) / (len(roll3[roll3 >= val]) or 1) / 365.25,
+    })
+
+# 7-day events
+roll7 = p.rolling(7).sum()
+extreme_7d = roll7[roll7 > roll7.quantile(0.99)].sort_values(ascending=False).head(30)
+for date, val in extreme_7d.items():
+    extreme_events.append({
+        "date": date,
+        "duration_days": 7,
+        "accumulation_mm": val,
+        "percentile": stats.percentileofscore(roll7.dropna(), val),
+        "return_period_approx_years": len(roll7.dropna()) / (len(roll7[roll7 >= val]) or 1) / 365.25,
+    })
+
+df_extreme = pd.DataFrame(extreme_events).sort_values(
+    ["duration_days", "accumulation_mm"], ascending=[True, False]
+)
+df_extreme.to_csv(CSV_EXTREME_EVENTS, index=False)
+
+# -----------------------
+# 3) CLIMATE EXTREME INDICES
+# -----------------------
+print("🔍 Calculating climate extreme indices...")
+
+# Per year
+yearly_indices = []
+
+for year in p.index.year.unique():
+    yr_data = p[p.index.year == year]
+    
+    if len(yr_data) < 300:  # Incomplete year
+        continue
+    
+    # Adapted ETCCDI indices
+    yearly_indices.append({
+        "year": year,
+        "total_precip_mm": yr_data.sum(),
+        "rx1day": yr_data.max(),  # Max 1-day
+        "rx5day": yr_data.rolling(5).sum().max(),  # Max 5-day
+        "r10mm": (yr_data >= 10).sum(),  # Days with >10mm
+        "r20mm": (yr_data >= 20).sum(),  # Days with >20mm
+        "r50mm": (yr_data >= 50).sum(),  # Days with >50mm
+        "r95p": yr_data[yr_data > yr_data.quantile(0.95)].sum(),  # Precip above P95
+        "r99p": yr_data[yr_data > yr_data.quantile(0.99)].sum(),  # Precip above P99
+        "cdd": max([len(list(g)) for k, g in yr_data.groupby((yr_data > 1).cumsum()) if k == 0] or [0]),  # Max consecutive dry days
+        "cwd": max([len(list(g)) for k, g in yr_data.groupby((yr_data > 1).cumsum()) if k != 0] or [0]),  # Max consecutive wet days
+        "sdii": yr_data[yr_data >= 1].mean() if (yr_data >= 1).any() else 0,  # Simple daily intensity index
+    })
+
+df_indices = pd.DataFrame(yearly_indices)
+df_indices.to_csv(CSV_CLIMATE_INDICES, index=False)
+
+# -----------------------
+# 4) TREND ANALYSIS
+# -----------------------
+print("🔍 Analyzing temporal trends...")
+
+trends = []
+
+for metric, series in [
+    ("total_annual_precip", df_indices["total_precip_mm"]),
+    ("rx1day", df_indices["rx1day"]),
+    ("rx5day", df_indices["rx5day"]),
+    ("r20mm_days", df_indices["r20mm"]),
+]:
+    if len(series) < 10:
+        continue
+        
+    x = df_indices["year"].values
+    y = series.values
+    
+    # Linear trend
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    
+    # Mann-Kendall
+    mk_stat, mk_p = stats.kendalltau(x, y)
+    
+    trends.append({
+        "metric": metric,
+        "slope_per_year": slope,
+        "slope_pvalue": p_value,
+        "r_squared": r_value**2,
+        "mann_kendall_tau": mk_stat,
+        "mann_kendall_pvalue": mk_p,
+        "trend_significant_5pct": p_value < 0.05,
+    })
+
+df_trends = pd.DataFrame(trends)
+df_trends.to_csv(CSV_TRENDS, index=False)
+
+# -----------------------
+# 5) SEASONAL STATISTICS
+# -----------------------
+print("🔍 Calculating seasonal statistics...")
+
+df["month"] = df["date"].dt.month
+df["season"] = df["month"].map({
+    12: "DJF", 1: "DJF", 2: "DJF",
+    3: "MAM", 4: "MAM", 5: "MAM",
+    6: "JJA", 7: "JJA", 8: "JJA",
+    9: "SON", 10: "SON", 11: "SON",
+})
+
+seasonal_stats = []
+
+for season in ["DJF", "MAM", "JJA", "SON"]:
+    season_data = df[df["season"] == season]["precip_mm"]
+    
+    seasonal_stats.append({
+        "season": season,
+        "mean_mm": season_data.mean(),
+        "median_mm": season_data.median(),
+        "std_mm": season_data.std(),
+        "p95_mm": season_data.quantile(0.95),
+        "p99_mm": season_data.quantile(0.99),
+        "max_mm": season_data.max(),
+        "days_above_10mm": (season_data >= 10).sum(),
+        "days_above_20mm": (season_data >= 20).sum(),
+    })
+
+df_seasonal = pd.DataFrame(seasonal_stats)
+df_seasonal.to_csv(CSV_SEASONAL_STATS, index=False)
+
+# -----------------------
+# 6) COMPREHENSIVE VISUAL PANEL
+# -----------------------
+print("🎨 Generating comprehensive visual panel...")
+
+fig = plt.figure(figsize=(16, 12))
+gs = fig.add_gridspec(4, 3, hspace=0.35, wspace=0.3)
+
+# --- Subplot 1: Annual time series ---
+ax1 = fig.add_subplot(gs[0, :])
+ax1.plot(df_indices["year"], df_indices["total_precip_mm"], marker="o", linewidth=1.5, markersize=4)
+z = np.polyfit(df_indices["year"], df_indices["total_precip_mm"], 1)
+pf = np.poly1d(z)
+ax1.plot(df_indices["year"], pf(df_indices["year"]), "--", alpha=0.7, color="red", 
+         label=f"Trend: {z[0]:.1f} mm/year")
+ax1.set_title("A) Total annual precipitation (1981-2025)", fontweight="bold", loc="left")
+ax1.set_ylabel("Precipitation (mm/year)")
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# --- Subplot 2: RX1day and RX5day ---
+ax2 = fig.add_subplot(gs[1, 0])
+ax2.plot(df_indices["year"], df_indices["rx1day"], marker="o", label="RX1day", linewidth=1, markersize=3)
+ax2.plot(df_indices["year"], df_indices["rx5day"], marker="s", label="RX5day", linewidth=1, markersize=3)
+ax2.set_title("B) Annual maxima", fontweight="bold", loc="left")
+ax2.set_ylabel("Precipitation (mm)")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# --- Subplot 3: Heavy rainfall days ---
+ax3 = fig.add_subplot(gs[1, 1])
+ax3.plot(df_indices["year"], df_indices["r10mm"], label="≥10mm", linewidth=1, marker="o", markersize=3)
+ax3.plot(df_indices["year"], df_indices["r20mm"], label="≥20mm", linewidth=1, marker="s", markersize=3)
+ax3.plot(df_indices["year"], df_indices["r50mm"], label="≥50mm", linewidth=1, marker="^", markersize=3)
+ax3.set_title("C) Heavy rainfall days", fontweight="bold", loc="left")
+ax3.set_ylabel("Number of days")
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+# --- Subplot 4: IDF curves (example: 1 and 3 days) ---
+ax4 = fig.add_subplot(gs[1, 2])
+for dur in [1, 3, 7]:
+    sub = df_idf[df_idf["duration_days"] == dur]
+    if len(sub) > 0:
+        ax4.plot(sub["return_period_years"], sub["intensity_mm"], marker="o", label=f"{dur}d")
+ax4.set_xscale("log")
+ax4.set_title("D) IDF curves", fontweight="bold", loc="left")
+ax4.set_xlabel("Return period (years)")
+ax4.set_ylabel("Intensity (mm)")
+ax4.legend()
+ax4.grid(True, alpha=0.3, which="both")
+
+# --- Subplot 5: Seasonality ---
+ax5 = fig.add_subplot(gs[2, 0])
+months = df.groupby("month")["precip_mm"].agg(["mean", "std", lambda x: x.quantile(0.95)])
+months.columns = ["mean", "std", "p95"]
+ax5.bar(months.index, months["mean"], yerr=months["std"], alpha=0.7, capsize=3)
+ax5.set_title("E) Seasonal cycle", fontweight="bold", loc="left")
+ax5.set_xlabel("Month")
+ax5.set_ylabel("Mean precipitation (mm/day)")
+ax5.set_xticks(range(1, 13))
+ax5.grid(True, axis="y", alpha=0.3)
+
+# --- Subplot 6: Statistics by season ---
+ax6 = fig.add_subplot(gs[2, 1])
+x_pos = np.arange(len(df_seasonal))
+ax6.bar(x_pos, df_seasonal["mean_mm"], alpha=0.7, label="Mean")
+ax6.errorbar(x_pos, df_seasonal["mean_mm"], yerr=df_seasonal["std_mm"], 
+             fmt="none", color="black", capsize=4, label="±1 std")
+ax6.set_xticks(x_pos)
+ax6.set_xticklabels(df_seasonal["season"])
+ax6.set_title("F) Statistics by season", fontweight="bold", loc="left")
+ax6.set_ylabel("Mean precipitation (mm/day)")
+ax6.legend()
+ax6.grid(True, axis="y", alpha=0.3)
+
+# --- Subplot 7: Distribution of extremes ---
+ax7 = fig.add_subplot(gs[2, 2])
+extreme_vals = p[p > threshold_p95]
+ax7.hist(extreme_vals, bins=30, alpha=0.7, edgecolor="black", density=True)
+ax7.axvline(threshold_p99, color="red", linestyle="--", linewidth=2, label=f"P99 = {threshold_p99:.1f} mm")
+ax7.set_title("G) Distribution of extremes (>P95)", fontweight="bold", loc="left")
+ax7.set_xlabel("Precipitation (mm/day)")
+ax7.set_ylabel("Density")
+ax7.legend()
+ax7.grid(True, alpha=0.3)
+
+# --- Subplot 8: Top-10 events by duration ---
+ax8 = fig.add_subplot(gs[3, :2])
+top_1d = df_extreme[df_extreme["duration_days"] == 1].head(10)
+top_3d = df_extreme[df_extreme["duration_days"] == 3].head(10)
+
+x = np.arange(10)
+width = 0.35
+if len(top_1d) >= 10:
+    ax8.barh(x - width/2, top_1d["accumulation_mm"].values, width, label="1-day", alpha=0.8)
+if len(top_3d) >= 10:
+    ax8.barh(x + width/2, top_3d["accumulation_mm"].values, width, label="3-day", alpha=0.8)
+ax8.set_yticks(x)
+ax8.set_yticklabels([f"#{i+1}" for i in range(10)])
+ax8.invert_yaxis()
+ax8.set_title("H) Top-10 extreme events", fontweight="bold", loc="left")
+ax8.set_xlabel("Accumulation (mm)")
+ax8.legend()
+ax8.grid(True, axis="x", alpha=0.3)
+
+# --- Subplot 9: Text summary ---
+ax9 = fig.add_subplot(gs[3, 2])
+ax9.axis("off")
+
+# Identify position of 2026 event
+event_accum_1d = p[EVENT_START:EVENT_END].sum()
+event_rank_1d = (df_extreme["duration_days"] == 1)
+if event_rank_1d.any():
+    event_position = (df_extreme[event_rank_1d]["accumulation_mm"] >= event_accum_1d).sum() + 1
+else:
+    event_position = "N/A"
+
+summary_text = f"""STATISTICAL SUMMARY
+
+Period: 1981-2025
+Total days: {len(p):,}
+
+EXTREMES:
+• P95 = {threshold_p95:.1f} mm
+• P99 = {threshold_p99:.1f} mm
+• Historical max = {p.max():.1f} mm
+
+FEB/2026 EVENT:
+• 3-day accum = {event_accum_1d:.1f} mm
+• Historical rank: #{event_position}
+• Percentile: {stats.percentileofscore(p, event_accum_1d):.1f}
+
+TRENDS:
+• Annual total: {df_trends.loc[df_trends['metric']=='total_annual_precip', 'slope_per_year'].values[0]:.1f} mm/year
+• RX1day: {"↑" if df_trends.loc[df_trends['metric']=='rx1day', 'slope_per_year'].values[0] > 0 else "↓"}
+"""
+
+ax9.text(0.05, 0.95, summary_text, va="top", ha="left", fontsize=9, family="monospace")
+
+plt.suptitle("Juiz de Fora — Comprehensive Precipitation Extremes Analysis", 
+             fontsize=16, fontweight="bold", y=0.995)
+plt.savefig(FIG_COMPREHENSIVE, dpi=DPI, bbox_inches="tight", facecolor="white")
+plt.show()
+plt.close()
+
+# -----------------------
+# 7) FINAL SUMMARY
+# -----------------------
+print("\n" + "="*60)
+print("✅ COMPLEMENTARY ANALYSES COMPLETED")
+print("="*60)
+print("\n📊 GENERATED FILES:")
+print(f"  1. IDF analysis: {CSV_IDF_ANALYSIS}")
+print(f"  2. Extremes catalog: {CSV_EXTREME_EVENTS}")
+print(f"  3. Climate indices: {CSV_CLIMATE_INDICES}")
+print(f"  4. Temporal trends: {CSV_TRENDS}")
+print(f"  5. Seasonal statistics: {CSV_SEASONAL_STATS}")
+print(f"  6. Visual panel: {FIG_COMPREHENSIVE}")
+
+print("\n📈 HIGHLIGHTS:")
+print(f"  • 2026 Event: {event_accum_1d:.1f} mm in 3 days")
+print(f"  • Historical ranking: #{event_position}")
+print(f"  • Percentile: {stats.percentileofscore(p, event_accum_1d):.1f}")
+print(f"  • Total cataloged extreme events: {len(df_extreme)}")
+print(f"  • IDF curves for {len(df_idf['duration_days'].unique())} durations")
+print("="*60)
